@@ -63,7 +63,25 @@ that fails outside the normal finalizer. Local mode interprets the exact same AS
 uses SQLite/files. Details: [Phase 6 guide](phase-6-orchestration.md) and
 [ADR 0011](ADRs/0011-durable-standard-workflow-and-resume.md).
 
-## Remediation and local validation (master Phases 7-8)
+## Least-privilege remediation (master Phase 7)
+
+```text
+over-broad identity policy (standalone JSON or SAM/CloudFormation YAML)
+  -> activity path: StartPolicyGeneration -> poll -> GetGeneratedPolicy
+       -> restrict the profile to access the replaced policy already granted
+  -> estimate path: literal boto3 calls -> actions narrowed inside the original resource scope
+  -> proof: local subset containment + strict narrowing (CheckNoNewAccess when reachable)
+  -> before/after diff + provenance (observed_activity | static_estimate) + coverage gaps
+```
+
+Both paths are offered side by side and labelled, because a policy generated from observed
+activity and one estimated from source code are not the same evidence. A cold-start principal
+with no activity history is reported as such, with guidance, instead of being given a policy
+dressed up as evidence. Details: [Phase 7 guide](phase-7-remediation.md),
+[ADR 0012](ADRs/0012-activity-and-estimate-provenance.md) and
+[ADR 0013](ADRs/0013-narrowing-proof-and-second-opinion.md).
+
+## Reviewed proposals and local validation (master Phase 8)
 
 ```text
 reviewed operations -> IAM proposal (JSON or SAM/CloudFormation YAML, never written to source)
@@ -82,6 +100,8 @@ reviewed operations -> IAM proposal (JSON or SAM/CloudFormation YAML, never writ
 | Scanned repository, archive, Git remote | Untrusted | Never executed while scanning; its scanner config is ignored |
 | Candidate code | Untrusted | Executed only in the ADR 0007 container sandbox |
 | Operations, manifest, approval | Trusted operator input | Must live outside the source tree |
+| Activity profile from IAM Access Analyzer | Untrusted advice | Scoped to the policy being replaced, proved narrower, reported with its CloudTrail window, never applied automatically |
+| Static estimate from source calls | Untrusted | Labelled an estimate everywhere, confined to the original resource scope, never presented as observed activity |
 | Packaged rules and Cedar policies | Trusted | Hashed into decisions and approvals |
 | Packaged prompts, playbooks and glossary | Trusted | Versioned into every explanation cache key |
 | User questions | Untrusted | Sanitized, redacted, screened for overrides; rewritten before any model sees them |

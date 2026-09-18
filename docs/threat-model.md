@@ -27,6 +27,8 @@ approvals are trusted local operator input and must live outside the source.
 | Candidate execution escapes | Digest-pinned images, internal network, dropped capabilities, read-only mounts, resource limits, forced cleanup. |
 | Over-narrow fix passes locally | Emulators ignore IAM, so proposals must cover estimated code actions; results report `aws_iam_status: not_verified`. |
 | Unsafe remediation | Proposals never write source; the PR gate needs runtime evidence and a bound approval; commit, merge and deploy are denied. |
+| A "fix" widens access instead of narrowing it | A candidate must pass the local subset proof *and* remove at least one action or resource; `CheckNoNewAccess` is a second opinion when reachable; an inconclusive proof is reported as `needs_review` and never as recommended; AWS resource placeholders count as unknown scope. |
+| An estimate is mistaken for evidence | Every recommendation names its method and confidence (`observed_activity` or `static_estimate`); a cold start is reported as `no_activity_history` with guidance, never as a policy. |
 | Prompt injection through repository text | Paths, resources and messages are sanitized, flagged and sent only as JSON evidence; flagged groups go to the large model; output that echoes instructions is rejected. |
 | Prompt injection or overrides in questions | Override, secret-disclosure and rule-change requests are blocked before any model call; questions are rewritten into canonical forms. |
 | Model changes or undermines a decision | Decisions are copied from Cedar, never from the model; claims such as "false positive" or "safe to deploy" fail validation; the report asserts decisions are unchanged. |
