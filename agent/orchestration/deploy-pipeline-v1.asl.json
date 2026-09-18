@@ -1,0 +1,147 @@
+{
+  "Comment": "Review-gated Deployment Pipeline",
+  "StartAt": "ValidateRequest",
+  "States": {
+    "ValidateRequest": {
+      "Type": "Task",
+      "Resource": "${DeployWorkerFunctionArn}",
+      "Parameters": {
+        "action": "validate",
+        "request.$": "$"
+      },
+      "ResultPath": "$.validation",
+      "Next": "CreateChangeSet"
+    },
+    "CreateChangeSet": {
+      "Type": "Task",
+      "Resource": "${DeployWorkerFunctionArn}",
+      "Parameters": {
+        "action": "create_change_set",
+        "request.$": "$"
+      },
+      "ResultPath": "$.change_set",
+      "Next": "PollChangeSet"
+    },
+    "PollChangeSet": {
+      "Type": "Task",
+      "Resource": "${DeployWorkerFunctionArn}",
+      "Parameters": {
+        "action": "describe_change_set",
+        "change_set_arn.$": "$.change_set.change_set_arn"
+      },
+      "ResultPath": "$.change_set_status",
+      "Next": "CheckChangeSetStatus"
+    },
+    "CheckChangeSetStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.change_set_status.Status",
+          "StringEquals": "CREATE_COMPLETE",
+          "Next": "RequireHumanApproval"
+        },
+        {
+          "Variable": "$.change_set_status.Status",
+          "StringEquals": "FAILED",
+          "Next": "FailDeployment"
+        }
+      ],
+      "Default": "WaitChangeSet"
+    },
+    "WaitChangeSet": {
+      "Type": "Wait",
+      "Seconds": 5,
+      "Next": "PollChangeSet"
+    },
+    "RequireHumanApproval": {
+      "Type": "Task",
+      "Resource": "arn:aws:states:::lambda:invoke.waitForTaskToken",
+      "Parameters": {
+        "FunctionName": "${DeployWorkerFunctionArn}",
+        "Payload": {
+          "action": "request_approval",
+          "request.$": "$",
+          "change_set_arn.$": "$.change_set.change_set_arn",
+          "task_token.$": "$$.Task.Token"
+        }
+      },
+      "ResultPath": "$.approval",
+      "Next": "ExecuteChangeSet"
+    },
+    "ExecuteChangeSet": {
+      "Type": "Task",
+      "Resource": "${DeployWorkerFunctionArn}",
+      "Parameters": {
+        "action": "execute_change_set",
+        "request.$": "$",
+        "change_set_arn.$": "$.change_set.change_set_arn"
+      },
+      "ResultPath": "$.execute_result",
+      "Next": "PollStack"
+    },
+    "PollStack": {
+      "Type": "Task",
+      "Resource": "${DeployWorkerFunctionArn}",
+      "Parameters": {
+        "action": "poll_execution",
+        "stack_name.$": "$.target_stack"
+      },
+      "ResultPath": "$.stack_status",
+      "Next": "CheckStackStatus"
+    },
+    "CheckStackStatus": {
+      "Type": "Choice",
+      "Choices": [
+        {
+          "Variable": "$.stack_status.status",
+          "StringEquals": "succeeded",
+          "Next": "SmokeTest"
+        },
+        {
+          "Variable": "$.stack_status.status",
+          "StringEquals": "rolled_back",
+          "Next": "RollbackDeployment"
+        },
+        {
+          "Variable": "$.stack_status.status",
+          "StringEquals": "in_progress",
+          "Next": "WaitStack"
+        },
+        {
+          "Variable": "$.stack_status.status",
+          "StringEquals": "failed",
+          "Next": "FailDeployment"
+        }
+      ],
+      "Default": "WaitStack"
+    },
+    "WaitStack": {
+      "Type": "Wait",
+      "Seconds": 5,
+      "Next": "PollStack"
+    },
+    "SmokeTest": {
+      "Type": "Task",
+      "Resource": "${DeployWorkerFunctionArn}",
+      "Parameters": {
+        "action": "smoke_test",
+        "endpoint.$": "$.smoke_test_endpoint"
+      },
+      "ResultPath": "$.smoke_test_result",
+      "Next": "SucceedDeployment"
+    },
+    "SucceedDeployment": {
+      "Type": "Succeed"
+    },
+    "RollbackDeployment": {
+      "Type": "Fail",
+      "Error": "RolledBack",
+      "Cause": "Stack deployment rolled back."
+    },
+    "FailDeployment": {
+      "Type": "Fail",
+      "Error": "DeploymentFailed",
+      "Cause": "Deployment encountered a failure."
+    }
+  }
+}

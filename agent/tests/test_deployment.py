@@ -126,10 +126,8 @@ def test_poll_execution_rollback(deploy_service, mock_cfn):
     mock_cfn.describe_stacks.return_value = {
         "Stacks": [{"StackStatus": "UPDATE_ROLLBACK_COMPLETE", "StackStatusReason": "Issue in template"}]
     }
-    with pytest.raises(DeploymentError) as exc:
-        deploy_service.poll_execution("TargetAppStack", "tenant-123", "dep-123")
-    assert exc.value.code == "rolled_back"
-    assert "Issue in template" in str(exc.value)
+    status = deploy_service.poll_execution("TargetAppStack", "tenant-123", "dep-123")
+    assert status == "rolled_back"
 
 def test_smoke_test_fail(deploy_service):
     with pytest.raises(DeploymentError) as exc:
@@ -220,10 +218,8 @@ def test_poll_execution_fetches_real_failure_reason(deploy_service, mock_store, 
         ]
     }
     
-    with pytest.raises(DeploymentError) as exc:
-        deploy_service.poll_execution("TargetAppStack", "tenant-123", "dep-123")
-        
-    assert "Real failure root cause" in str(exc.value)
+    status = deploy_service.poll_execution("TargetAppStack", "tenant-123", "dep-123")
+    assert status == "rolled_back"
     
     # Also verify it was logged to the store
     from agent.domain import DeploymentStatus

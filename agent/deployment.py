@@ -170,27 +170,22 @@ class DeployService:
     def poll_execution(self, stack_name: str, tenant_id: str, deployment_id: str) -> str:
         from agent.domain import DeploymentStatus
         try:
-            for _ in range(60):
-                res = self.client.describe_stacks(StackName=stack_name)
-                status = res['Stacks'][0]['StackStatus']
+            res = self.client.describe_stacks(StackName=stack_name)
+            status = res['Stacks'][0]['StackStatus']
+            
+            if status.endswith('_COMPLETE') and 'ROLLBACK' not in status:
+                self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.SUCCEEDED, int(time.time()))
+                return "succeeded"
+            if 'ROLLBACK' in status and status.endswith('_COMPLETE'):
+                reason = self._get_stack_failure_reason(stack_name) or res['Stacks'][0].get('StackStatusReason', 'Rolled back')
+                self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.ROLLED_BACK, int(time.time()), rollback_status=reason)
+                return "rolled_back"
+            if status.endswith('_FAILED'):
+                reason = self._get_stack_failure_reason(stack_name) or res['Stacks'][0].get('StackStatusReason', 'Failed')
+                self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status=reason)
+                return "failed"
                 
-                if status.endswith('_COMPLETE') and 'ROLLBACK' not in status:
-                    self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.SUCCEEDED, int(time.time()))
-                    # We do not release lock yet if smoke test is next. (Or wait, smoke test releases it!)
-                    return "succeeded"
-                if 'ROLLBACK' in status and status.endswith('_COMPLETE'):
-                    reason = self._get_stack_failure_reason(stack_name) or res['Stacks'][0].get('StackStatusReason', 'Rolled back')
-                    self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.ROLLED_BACK, int(time.time()), rollback_status=reason)
-                    raise DeploymentError("rolled_back", f"Deployment rolled back: {reason}")
-                if status.endswith('_FAILED'):
-                    reason = self._get_stack_failure_reason(stack_name) or res['Stacks'][0].get('StackStatusReason', 'Failed')
-                    self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status=reason)
-                    raise DeploymentError("failed", f"Deployment failed: {reason}")
-                    
-                time.sleep(5)
-                
-            self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status="rollback_timed_out")
-            raise DeploymentError("rollback_timed_out", "Deployment timed out.")
+            return "in_progress"
         except Exception:
             self.store.release_lock(tenant_id, stack_name)
             raise
