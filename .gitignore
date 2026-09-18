@@ -18,3 +18,4 @@ build/
 .verification-repos/
 proposal.json
 .freebuff/
+.aws-sam/
