@@ -1,9 +1,9 @@
 # Phase 4 — finding policy evaluation
 
 Phase numbering here follows the master reference and the latest user request:
-Phase 4 is Cedar, Phase 5 is AI reasoning. The earlier conversation's Phase 3
-remediation/runtime implementation remains on hold. This work does not open its
-PR gate or resume its runtime implementation.
+Phase 4 is Cedar, Phase 5 is AI reasoning. The remediation/runtime work once
+called "Phase 3" is now complete; see [the Phase 3 guide](phase-3.md). Finding
+triage here never opens its PR gate.
 
 ## Implemented workflow
 
@@ -29,25 +29,29 @@ use the separate remediation governance gate. `needs_human_approval` is a
 triage escalation, not proof of runtime validation. `deny` covers absent or
 invalid context, stale source, partial scans, and evaluation errors.
 
-Ten versioned Cedar files in `agent/policies/findings/` handle categories,
+Eleven versioned Cedar files in `agent/policies/findings/` handle categories,
 missing context, conflicting environments, aggregate risk, volume and examples.
+`unsafe_command_execution` (Semgrep `shell=True` and subprocess rules) always
+requires review.
 Cedar default deny and forbid-overrides-permit are the only precedence rules.
 There is no custom most-specific-wins mode. Each decision records source hash,
 policy hash, matched human-readable rule IDs, effective environment/severity,
-upstream integer confidence, and resource count.
+evidence class, and resource count.
 
-Unknown rules receive confidence 50; existing auth/input regex heuristics 70;
-required-environment detection 90; the recognized Gitleaks rule 95. These values
-express versioned detector certainty and aren't model-generated probabilities.
-The tests pin the threshold at 89/90/91. Every IAM or non-example secret finding
-requires review; auth findings require review even at high confidence.
+There is no hand-assigned numerical confidence gate. Required-environment
+detection is marked `deterministic_fact`; route heuristics and external detector
+results are `detector_or_heuristic` and need review. Every IAM or non-example
+secret finding requires review, as do authentication findings. This prevents a
+number from being mistaken for a calibrated probability.
 
 Multiple environment tags conservatively resolve to production. Unknown tags
 still deny. Three findings sharing a resource escalate. Without a correlated
 resource ID, grouping falls back to file path; this deliberately favors review.
 Known examples are downgraded only when the Gitleaks adapter confirms the exact
 public example value AND the path has a test/tests/fixtures/docs directory
-component. Raw secret values are not included in the decision or cache.
+component. Gitleaks' default rules already allowlist that public example, so with
+the packaged configuration this path is unreachable; it remains as a guarded rule
+for custom Gitleaks rules. Raw secret values are not included in the decision or cache.
 
 ## Cost and concurrency
 
@@ -70,12 +74,16 @@ fail closed; engine errors are never cached. Stored results retain policy
 version and matched rule IDs with creation time for subsequent audit.
 
 The SQLite file is trusted application state, outside the submitted repository.
-It is suitable for this local phase, not shared Lambda durable storage; a cloud
-adapter will need conditional writes/leases and authenticated audit access.
+`LocalScanStore` supplies that developer experience. `DynamoScanStore` uses the
+same store interface and conditional writes for Scan, Finding, PolicyDecision,
+and DeploymentAttempt records; the API/control-plane can use it when
+`FIRST_COMMIT_MODE=aws`. The CLI retains `--cache-db` for an explicit local,
+portable policy-audit file.
 
 ## Phase 5 handoff, not implemented in this phase
 
-AI explanations must never mutate Cedar decisions or supply confidence. The
+A future model may write explanations and escalate to review, but must never
+lower Cedar's decision or supply a permission probability. The
 model interface must accept bounded structured facts only, group by category,
 enforce a fixed total-attempt/model-call budget, deduplicate concurrent requests,
 cache on stable policy/evidence/model/prompt versions, and separately report

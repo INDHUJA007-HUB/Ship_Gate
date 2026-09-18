@@ -10,8 +10,8 @@ cedarpy 4.8.7 native engine.
   creation time and versioned finding decisions; no evidence prose persisted.
 - Native Cedar tests: default deny; explicit missing-environment forbid;
   cross-tenant and stale-source denial; conservative production resolution;
-  compound-risk and volume escalation; 89/90/91 confidence boundaries; high
-  severity override; known-example/path conjunction; unknown confidence ignored.
+  compound-risk and volume escalation; deterministic-fact versus heuristic
+  evidence classification; high-severity override; known-example/path conjunction.
 - Cost tests: reversed finding ordering and changed filesystem root preserve
   cache hits; changed tenant/user/policy and partial-scan state invalidate;
   four simultaneous identical requests evaluate once; hard cap issues zero
