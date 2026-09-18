@@ -14,21 +14,17 @@ from pathlib import Path, PurePosixPath
 import cedarpy
 
 from agent.models import Finding, ScanReport
+from agent.store import ScanStore
 
 ENGINE_VERSION = "finding-policy-1"
-# Deterministic rule certainty, not severity and never model self-confidence.
-RULE_CONFIDENCE = {
-    ("first-commit-patterns", "missing-required-environment"): 90,
-    ("first-commit-patterns", "route-missing-auth"): 70,
-    ("first-commit-patterns", "route-missing-input-validation"): 70,
-    ("gitleaks", "aws-access-token"): 95,
-}
+DETERMINISTIC_FACTS = {("first-commit-patterns", "missing-required-environment")}
 CATEGORIES = {
     "secret",
     "iam_wildcard",
     "missing_auth",
     "missing_input_validation",
     "missing_environment_variable",
+    "unsafe_command_execution",
 }
 
 
@@ -82,16 +78,21 @@ def facts(finding: Finding):
         "resource": resource,
         "example": example,
         "validPath": valid_path,
-        "confidence": RULE_CONFIDENCE.get(
-            (finding.evidence.detector, finding.evidence.rule_id), 50
-        ),
+        "evidenceClass": "deterministic_fact"
+        if (finding.evidence.detector, finding.evidence.rule_id) in DETERMINISTIC_FACTS
+        else "detector_or_heuristic",
         "detector": finding.evidence.detector,
         "rule": finding.evidence.rule_id,
     }
 
 
 class FindingPolicy:
-    def __init__(self, cache_path: Path, limits: PolicyLimits | None = None):
+    def __init__(
+        self,
+        cache_path: Path | None = None,
+        limits: PolicyLimits | None = None,
+        store: ScanStore | None = None,
+    ):
         directory = Path(__file__).parent / "policies" / "findings"
         self.policy_text = "\n".join(
             p.read_text(encoding="utf-8") for p in sorted(directory.glob("*.cedar"))
@@ -100,6 +101,7 @@ class FindingPolicy:
         self.reason_names = dict(enumerate(re.findall(r'@id\("([^"]+)"\)', self.policy_text)))
         self.limits = limits or PolicyLimits()
         self.cache_path = cache_path
+        self.store = store
         # Parse errors are caught during evaluate and never treated as a clean result.
         self._parsed = None
 
@@ -136,6 +138,16 @@ class FindingPolicy:
         # Environment order and duplicate tags cannot create retry cache misses.
         material["context"]["environments"] = sorted(set(context.environments))
         key = hashlib.sha256(stable(material).encode()).hexdigest()
+        if self.store is not None:
+            return self._evaluate_with_store(key, normalized, report, context, base)
+        if self.cache_path is None:
+            return {
+                **base,
+                "status": "error",
+                "reason": "policy_store_unconfigured",
+                "decisions": [],
+                "cedar_requests": 0,
+            }
         try:
             self.cache_path.parent.mkdir(parents=True, exist_ok=True)
             connection = sqlite3.connect(self.cache_path, timeout=10)
@@ -182,6 +194,28 @@ class FindingPolicy:
         finally:
             connection.close()
 
+    def _evaluate_with_store(self, key, normalized, report, context, base):
+        try:
+            cached = self.store.get_policy_decision(context.tenant, context.user, key)
+            if cached:
+                return {**cached, "cached": True, "cedar_requests": 0}
+            result = self._evaluate(normalized, report, context, base)
+            if result["status"] != "error" and not self.store.put_policy_decision(
+                context.tenant, context.user, key, result
+            ):
+                cached = self.store.get_policy_decision(context.tenant, context.user, key)
+                if cached:
+                    return {**cached, "cached": True, "cedar_requests": 0}
+            return result
+        except Exception:
+            return {
+                **base,
+                "status": "error",
+                "reason": "policy_store_or_engine_error",
+                "decisions": [],
+                "cedar_requests": 0,
+            }
+
     def _evaluate(self, normalized, report, context, base):
         environments = set(context.environments)
         known = {"development", "staging", "production"}
@@ -219,7 +253,7 @@ class FindingPolicy:
         for index, finding in enumerate(normalized):
             attrs = {
                 "category": finding["category"],
-                "confidence": finding["confidence"],
+                "evidenceClass": finding["evidenceClass"],
                 "severity": finding["severity"],
                 "example": finding["example"],
                 "resourceCount": counts[finding["resource"]],
@@ -269,7 +303,7 @@ class FindingPolicy:
                         "policy_version": self.version,
                         "content_hash": finding["source"],
                         "effective_environment": environment,
-                        "confidence_percent": finding["confidence"],
+                        "evidence_class": finding["evidenceClass"],
                         "effective_severity": "info" if finding["example"] else finding["severity"],
                         "resource_count": counts[finding["resource"]],
                         "reasons": sorted(

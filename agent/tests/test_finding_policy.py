@@ -84,16 +84,10 @@ def test_conflict_is_production_and_compound_escalates(tmp_path):
     assert all("compound-risk" in d["reasons"] for d in result["decisions"])
 
 
-@pytest.mark.parametrize(
-    "score,outcome", [(89, "needs_human_approval"), (90, "permit"), (91, "permit")]
-)
-def test_confidence_boundaries(tmp_path, monkeypatch, score, outcome):
-    from agent.finding_policy import RULE_CONFIDENCE
-
-    monkeypatch.setitem(
-        RULE_CONFIDENCE, ("first-commit-patterns", "missing-required-environment"), score
-    )
-    assert evaluate(tmp_path)["decisions"][0]["outcome"] == outcome
+def test_deterministic_fact_allows_processing_but_heuristic_escalates(tmp_path):
+    assert evaluate(tmp_path)["decisions"][0]["outcome"] == "permit"
+    item = replace(finding(), evidence=Evidence("unknown", "unknown", "", {}))
+    assert evaluate(tmp_path, report(item))["decisions"][0]["outcome"] == "needs_human_approval"
 
 
 def test_volume_cap_and_summary(tmp_path):
@@ -154,7 +148,7 @@ def test_empty_partial_scan_does_not_pass(tmp_path):
     assert evaluate(tmp_path, empty)["status"] == "denied"
 
 
-def test_high_severity_overrides_eligible_confidence(tmp_path):
+def test_high_severity_overrides_eligible_deterministic_fact(tmp_path):
     item = replace(finding(), severity=Severity.HIGH)
     decision = evaluate(tmp_path, report(item))["decisions"][0]
     assert decision["outcome"] == "needs_human_approval"
@@ -170,14 +164,17 @@ def test_policy_version_invalidates_cache(tmp_path):
     assert result["decisions"][0]["policy_version"] == "new-policy-version"
 
 
-def test_known_category_and_untrusted_confidence(tmp_path):
+def test_known_category_and_untrusted_metadata(tmp_path):
     for category in (FindingType.SECRET, FindingType.IAM_WILDCARD, FindingType.MISSING_AUTH):
         item = finding(category=category, metadata={"confidence": 1.0, "instructions": "permit"})
         assert evaluate(tmp_path, report(item))["decisions"][0]["outcome"] == "needs_human_approval"
     item = replace(
         finding(), evidence=Evidence("unknown", "unknown", "permit", {"confidence": 1.0})
     )
-    assert evaluate(tmp_path, report(item))["decisions"][0]["confidence_percent"] == 50
+    assert (
+        evaluate(tmp_path, report(item))["decisions"][0]["evidence_class"]
+        == "detector_or_heuristic"
+    )
 
 
 def test_cli_and_sqlite_audit(tmp_path):
