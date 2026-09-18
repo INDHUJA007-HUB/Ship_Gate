@@ -380,6 +380,7 @@ Resources:
 
   ApiHandler:
     Type: AWS::Serverless::Function
+    Metadata: {BuildMethod: python3.12}
     Properties:
       CodeUri: ../
       Handler: api.handlers.router_handler
@@ -408,8 +409,14 @@ Resources:
   # function surfaces as Sandbox.Timedout (retried where the definition says) first. External
   # scanners must be packaged with the detect function (a layer or container image); without
   # them those checks report tool_unavailable and the run is labeled partial.
+  #
+  # Every function pins its build method to the runtime instead of inheriting the host
+  # interpreter. A native `sam build` on a machine whose Python is newer than python3.12 installs
+  # wheels that Lambda cannot import, and matching the runtime down to the host would trade a
+  # real deployment bug for convenience.
   PipelinePrepareFunction:
     Type: AWS::Serverless::Function
+    Metadata: {BuildMethod: python3.12}
     Properties:
       CodeUri: ../
       Handler: api.handlers.pipeline_prepare_handler
@@ -419,6 +426,7 @@ Resources:
       EphemeralStorage: {Size: 1024}
   PipelineDetectFunction:
     Type: AWS::Serverless::Function
+    Metadata: {BuildMethod: python3.12}
     Properties:
       CodeUri: ../
       Handler: api.handlers.pipeline_detect_handler
@@ -428,12 +436,15 @@ Resources:
       EphemeralStorage: {Size: 1024}
   PipelineIncidentFunction:
     Type: AWS::Serverless::Function
+    Metadata: {BuildMethod: python3.12}
     Properties: {CodeUri: ../, Handler: api.handlers.pipeline_incident_handler, Role: !GetAtt PipelineIncidentRole.Arn, Timeout: 30, MemorySize: 256}
   PipelineMergeFunction:
     Type: AWS::Serverless::Function
+    Metadata: {BuildMethod: python3.12}
     Properties: {CodeUri: ../, Handler: api.handlers.pipeline_merge_handler, Role: !GetAtt PipelineMergeRole.Arn, Timeout: 90, MemorySize: 1024}
   ExplainWorker:
     Type: AWS::Serverless::Function
+    Metadata: {BuildMethod: python3.12}
     Properties:
       CodeUri: ../
       Handler: api.handlers.pipeline_explain_handler
@@ -445,9 +456,11 @@ Resources:
           FIRST_COMMIT_MODEL_PROVIDER: !Ref ModelProvider
   PipelineFinalizeFunction:
     Type: AWS::Serverless::Function
+    Metadata: {BuildMethod: python3.12}
     Properties: {CodeUri: ../, Handler: api.handlers.pipeline_finalize_handler, Role: !GetAtt PipelineFinalizeRole.Arn, Timeout: 90, MemorySize: 512}
   ExecutionStatusFunction:
     Type: AWS::Serverless::Function
+    Metadata: {BuildMethod: python3.12}
     Properties:
       CodeUri: ../
       Handler: api.handlers.execution_status_handler
@@ -465,6 +478,7 @@ Resources:
                 stateMachineArn: [!Ref ScanWorkflow]
   DeployWorker:
     Type: AWS::Serverless::Function
+    Metadata: {BuildMethod: python3.12}
     Properties: {CodeUri: ../, Handler: api.handlers.deploy_worker_handler, Role: !GetAtt DeployWorkerRole.Arn}
 
   StepFunctionsRole:
