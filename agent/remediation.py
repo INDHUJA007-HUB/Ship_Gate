@@ -9,14 +9,33 @@ import json
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from agent.code_actions import required_actions
 from agent.config import ScanLimits
 from agent.governance import Governance
-from agent.iam import check_no_expansion, policy_from_evidence
+from agent.iam import check_no_expansion, policy_from_evidence, statements
+from agent.policy_documents import identity_policy, load_document, replace_policy, serialize
 from agent.preflight import inspect_tree
 
 
 class ValidationRejected(ValueError):
     """A safe, source-free rejection code suitable for public reports."""
+
+
+def missing_code_actions(root: Path, files, policy: dict) -> tuple[tuple[str, ...], bool]:
+    """Actions the code's literal boto3 calls need but `policy` does not grant.
+
+    Local emulators do not enforce IAM, so this static estimate is what stops an over-narrow
+    fix that would pass local validation yet break the application on AWS.
+    """
+    granted = [
+        action
+        for statement in statements(policy)
+        for action in (
+            [statement["Action"]] if isinstance(statement["Action"], str) else statement["Action"]
+        )
+    ]
+    estimate = required_actions(root, files)
+    return estimate.missing_from(granted), bool(estimate.unresolved)
 
 
 def canonical(value):
@@ -76,15 +95,20 @@ def propose_iam(
     if decision.outcome != "permit":
         raise ValueError(decision.reason)
     path = _target(root, relative)
-    if path.suffix.lower() != ".json":
-        raise ValueError("This phase supports standalone JSON identity policies only")
+    if path.suffix.lower() not in {".json", ".yaml", ".yml"}:
+        raise ValueError("JSON or SAM YAML required")
     before_bytes = path.read_bytes()
     before = before_bytes.decode("utf-8")
     candidate = policy_from_evidence(operations)
-    check = check_no_expansion(json.loads(before), candidate)
+    document = load_document(before)
+    selector, original_policy = identity_policy(document)
+    check = check_no_expansion(original_policy, candidate)
     if check.status != "safe":
         raise ValueError(f"{check.status}: {check.reason}")
-    replacement = canonical(candidate)
+    missing, _ = missing_code_actions(root, scan.files, candidate)
+    if missing:
+        raise ValueError("candidate_policy_missing_code_actions: " + ", ".join(missing))
+    replacement = serialize(replace_policy(document, selector, candidate), path.suffix.lower())
     fields = {
         "source_hash": scan.content_hash,
         "target": Path(relative).as_posix(),
@@ -148,7 +172,16 @@ def validate_proposal(
         if hashlib.sha256(content).hexdigest() != proposal.before_hash:
             raise ValidationRejected("patch_precondition_failed")
         checks.append("source_and_proposal_integrity")
-        check = check_no_expansion(json.loads(content), json.loads(proposal.replacement))
+        original = load_document(content.decode("utf-8"))
+        candidate = load_document(proposal.replacement)
+        selector, original_policy = identity_policy(original)
+        candidate_selector, candidate_policy = identity_policy(candidate)
+        if (
+            selector != candidate_selector
+            or replace_policy(original, selector, candidate_policy) != candidate
+        ):
+            raise ValidationRejected("non_iam_changes_rejected")
+        check = check_no_expansion(original_policy, candidate_policy)
         if check.status != "safe":
             raise ValidationRejected(f"iam_{check.status}")
         checks.append("static_iam_subset")
@@ -156,6 +189,10 @@ def validate_proposal(
             if source.suffix == ".py":
                 ast.parse(source.read_bytes(), filename=source.relative_to(root).as_posix())
         checks.append("python_syntax_without_execution")
+        missing, partial = missing_code_actions(root, scan.files, candidate_policy)
+        if missing:
+            raise ValidationRejected("candidate_policy_missing_code_actions:" + ",".join(missing))
+        checks.append("code_actions_estimate_partial" if partial else "code_actions_covered")
         return Validation("static_validated", tuple(checks), ())
     except ValidationRejected as error:
         return Validation("unvalidated", tuple(checks), (str(error),))
