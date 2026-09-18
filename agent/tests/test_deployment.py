@@ -103,6 +103,7 @@ def test_tenant_isolation(deploy_service, mock_store, valid_request):
 
 def test_create_change_set(deploy_service, mock_cfn, valid_request):
     mock_cfn.create_change_set.return_value = {"Id": "arn:aws:cloudformation:us-east-1:123:changeSet/test"}
+    mock_cfn.describe_change_set.return_value = {"Status": "CREATE_COMPLETE"}
     arn = deploy_service.create_change_set(valid_request, "{}", "dep-123")
     assert arn.startswith("arn:aws")
     mock_cfn.create_change_set.assert_called_once()
@@ -142,6 +143,7 @@ def test_smoke_test_timeout(deploy_service):
 
 def test_full_run_transitions_and_audit_order(deploy_service, mock_store, mock_cfn, valid_request):
     mock_cfn.create_change_set.return_value = {"Id": "arn"}
+    mock_cfn.describe_change_set.return_value = {"Status": "CREATE_COMPLETE"}
     deploy_service.create_change_set(valid_request, "{}", "dep-123")
     
     # Assert create_deployment was called before create_change_set
@@ -229,3 +231,23 @@ def test_poll_execution_fetches_real_failure_reason(deploy_service, mock_store, 
     failed_calls = [c for c in calls if (c.args[2] if len(c.args)>2 else c.kwargs.get("status")) == DeploymentStatus.ROLLED_BACK]
     args, kwargs = failed_calls[-1]
     assert kwargs.get("rollback_status") == "Real failure root cause"
+
+def test_create_change_set_wait_timeout(deploy_service, mock_store, mock_cfn, valid_request, monkeypatch):
+    mock_store.acquire_lock.return_value = True
+    mock_cfn.create_change_set.return_value = {"Id": "arn"}
+    mock_cfn.describe_change_set.return_value = {"Status": "CREATE_IN_PROGRESS"}
+    monkeypatch.setattr("time.sleep", lambda x: None)  # speed up test
+    with pytest.raises(DeploymentError) as exc:
+        deploy_service.create_change_set(valid_request, "{}", "dep-123")
+    assert exc.value.code == "change_set_timeout"
+    mock_store.release_lock.assert_called_with("tenant-123", "TargetAppStack")
+
+def test_create_change_set_wait_empty(deploy_service, mock_store, mock_cfn, valid_request, monkeypatch):
+    mock_store.acquire_lock.return_value = True
+    mock_cfn.create_change_set.return_value = {"Id": "arn"}
+    mock_cfn.describe_change_set.return_value = {"Status": "FAILED", "StatusReason": "The submitted information didn't contain changes"}
+    monkeypatch.setattr("time.sleep", lambda x: None)
+    with pytest.raises(DeploymentError) as exc:
+        deploy_service.create_change_set(valid_request, "{}", "dep-123")
+    assert exc.value.code == "change_set_empty"
+    mock_store.release_lock.assert_called_with("tenant-123", "TargetAppStack")

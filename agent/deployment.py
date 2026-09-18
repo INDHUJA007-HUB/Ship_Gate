@@ -99,7 +99,7 @@ class DeployService:
                 ChangeSetType='UPDATE',
                 Capabilities=['CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM']
             )
-            return res['Id']
+            change_set_id = res['Id']
         except Exception as e:
             self.store.set_deployment_status(request.tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status=str(e))
             self.store.release_lock(request.tenant_id, request.target_stack)
@@ -111,8 +111,30 @@ class DeployService:
                     ChangeSetType='CREATE',
                     Capabilities=['CAPABILITY_IAM', 'CAPABILITY_NAMED_IAM']
                 )
-                return res['Id']
-            raise DeploymentError("cfn_error", str(e))
+                change_set_id = res['Id']
+            else:
+                raise DeploymentError("cfn_error", str(e))
+                
+        # Wait up to 30 seconds for the change set to be ready
+        for _ in range(30):
+            describe_res = self.client.describe_change_set(ChangeSetName=change_set_id)
+            status = describe_res.get('Status')
+            if status == 'CREATE_COMPLETE':
+                return change_set_id
+            if status == 'FAILED':
+                reason = describe_res.get('StatusReason', '')
+                if "didn't contain changes" in reason or "The submitted information didn't contain changes" in reason:
+                    self.store.set_deployment_status(request.tenant_id, deployment_id, DeploymentStatus.CANCELLED, int(time.time()), rollback_status="change_set_empty")
+                    self.store.release_lock(request.tenant_id, request.target_stack)
+                    raise DeploymentError("change_set_empty", "The change set contains no changes.")
+                self.store.set_deployment_status(request.tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status=reason)
+                self.store.release_lock(request.tenant_id, request.target_stack)
+                raise DeploymentError("cfn_error", f"Change set failed: {reason}")
+            time.sleep(1)
+            
+        self.store.set_deployment_status(request.tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status="change_set_timeout")
+        self.store.release_lock(request.tenant_id, request.target_stack)
+        raise DeploymentError("change_set_timeout", "Timed out waiting for change set to be created.")
 
     def describe_change_set(self, change_set_arn: str, tenant_id: str, deployment_id: str, stack_name: str) -> dict:
         from agent.domain import DeploymentStatus
