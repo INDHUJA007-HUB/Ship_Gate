@@ -14,6 +14,7 @@ dependencies = ["PyYAML>=6.0.2", "cedarpy==4.8.7"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3", "ruff>=0.9"]
+aws = ["boto3>=1.43,<2"]
 
 [project.scripts]
 first-commit = "agent.cli:main"

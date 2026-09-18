@@ -4,6 +4,8 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
+from agent.toolchain import command
+
 
 @dataclass(frozen=True, slots=True)
 class ScanLimits:
@@ -17,9 +19,9 @@ class ScanLimits:
 @dataclass(frozen=True, slots=True)
 class Settings:
     mode: str = "local"
-    gitleaks_bin: str = "gitleaks"
-    semgrep_bin: str = "semgrep"
-    checkov_bin: str = "checkov"
+    gitleaks_command: tuple[str, ...] = ("gitleaks",)
+    semgrep_command: tuple[str, ...] = ("semgrep",)
+    checkov_command: tuple[str, ...] = ("checkov",)
     limits: ScanLimits = ScanLimits()
 
     @classmethod
@@ -27,12 +29,15 @@ class Settings:
         timeout = int(os.getenv("FIRST_COMMIT_SCAN_TIMEOUT_SECONDS", "60"))
         return cls(
             mode=os.getenv("FIRST_COMMIT_MODE", "local"),
-            gitleaks_bin=os.getenv("FIRST_COMMIT_GITLEAKS_BIN", "gitleaks"),
-            semgrep_bin=os.getenv("FIRST_COMMIT_SEMGREP_BIN", "semgrep"),
-            checkov_bin=os.getenv("FIRST_COMMIT_CHECKOV_BIN", "checkov"),
+            gitleaks_command=command("gitleaks"),
+            semgrep_command=command("semgrep"),
+            checkov_command=command("checkov"),
             limits=ScanLimits(timeout_seconds=timeout),
         )
 
 
+RULES = Path(__file__).parent / "rules"
+
+
 def semgrep_rules_path() -> Path:
-    return Path(__file__).parent / "rules" / "semgrep.yml"
+    return RULES / "semgrep.yml"

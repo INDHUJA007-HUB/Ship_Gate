@@ -1,4 +1,5 @@
 .venv/
+.tools/
 __pycache__/
 *.py[cod]
 .pytest_cache/
@@ -14,4 +15,5 @@ build/
 .first-commit-cache/
 .pytest-tmp/
 .test-temp/
+.verification-repos/
 proposal.json
