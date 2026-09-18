@@ -54,6 +54,11 @@ def _covered(candidate, existing, *, action=False):
     return fnmatchcase(candidate, existing)
 
 
+def covered_by(candidate: str, existing: str, *, action: bool = False) -> bool:
+    """Public form of the containment rule `check_no_expansion` applies to a single value."""
+    return _covered(candidate, existing, action=action)
+
+
 def check_no_expansion(before, after) -> AccessCheck:
     try:
         old, new = statements(before), statements(after)

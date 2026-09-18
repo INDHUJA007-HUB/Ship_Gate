@@ -42,7 +42,7 @@ def canonical(value):
     return json.dumps(value, sort_keys=True, indent=2) + "\n"
 
 
-def _target(root: Path, relative: str) -> Path:
+def resolve_target(root: Path, relative: str) -> Path:
     path = Path(relative)
     if path.is_absolute() or ".." in path.parts or not path.parts:
         raise ValueError("Target must be a relative file inside the repository")
@@ -94,7 +94,7 @@ def propose_iam(
     )
     if decision.outcome != "permit":
         raise ValueError(decision.reason)
-    path = _target(root, relative)
+    path = resolve_target(root, relative)
     if path.suffix.lower() not in {".json", ".yaml", ".yml"}:
         raise ValueError("JSON or SAM YAML required")
     before_bytes = path.read_bytes()
@@ -167,7 +167,7 @@ def validate_proposal(
         scan = inspect_tree(root, ScanLimits())
         if scan.content_hash != proposal.source_hash:
             raise ValidationRejected("source_changed_rescan_required")
-        path = _target(root, proposal.target)
+        path = resolve_target(root, proposal.target)
         content = path.read_bytes()
         if hashlib.sha256(content).hexdigest() != proposal.before_hash:
             raise ValidationRejected("patch_precondition_failed")
