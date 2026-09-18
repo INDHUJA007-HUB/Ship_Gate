@@ -28,6 +28,39 @@ Environment: Windows 11, Python 3.13 virtual environment, Strands Agents 1.55.1,
 - A Strands direct tool request was tenant-bound and used zero model calls. Guard tests pin the
   one-model-call ceiling, duplicate-call suppression, and one-state-change ceiling.
 
+## Container build (2026-09-14)
+
+The build verification that this phase had left open is now complete, and it found a real
+packaging bug on the way.
+
+- The host has Python 3.13 only, so a native `sam build` installs dependencies for the wrong
+  interpreter *and* the wrong platform. The local virtual environment holds
+  `_internal.cp313-win_amd64.pyd`, a Windows cp313 extension module that a `python3.12` x86_64
+  Lambda cannot import. Rather than loosen the runtime pin, every function now declares
+  `Metadata: {BuildMethod: python3.12}`, so its build method is pinned to `Globals.Function.Runtime`
+  and a guard test fails if the two ever disagree.
+- `sam build --use-container` with SAM CLI 1.166.1 resolved the official image
+  `public.ecr.aws/sam/build-python3.12:latest-x86_64` and finished with **Build Succeeded** for all
+  nine functions sharing one `CodeUri`.
+- The artifact is Python 3.12 Linux only: 72 shared objects, 0 `.pyd` files, 0 cp313 artefacts,
+  and `cedarpy/_internal.cpython-312-x86_64-linux-gnu.so` in place of the host's `.pyd`.
+- The artifact imports on the real runtime image `public.ecr.aws/lambda/python:3.12`
+  (Python 3.12.14): `api.handlers`, `agent.orchestration.pipeline`, `agent.orchestration.steps`,
+  `agent.orchestration.claude_model`, `agent.reasoning.providers`, `agent.least_privilege`,
+  `cedarpy` and `strands`.
+- That import test is what exposed the bug: `requirements.txt` declared PyYAML, cedarpy and
+  anthropic, but **not** `strands-agents`, which `pyproject.toml` declares as a runtime dependency
+  and `agent/orchestration/agent.py` imports. The artifact built, installed and imported before
+  the gap was visible, so only running the packaged code found it. `requirements.txt` is fixed and
+  `agent/tests/test_packaging_manifest.py` now fails if the Lambda manifest and `pyproject.toml`
+  drift apart again.
+- Building in place is not usable: SAM copies the whole `CodeUri` tree into the container, so a
+  working copy with `.venv/` and `.tools/` present copies tens of thousands of files and exceeded
+  ten minutes twice without finishing. The verification above was run from a clean tree (a copy of
+  the tracked plus uncommitted-not-ignored files), which is what a deployment from a checkout looks
+  like. `.aws-sam/` is ignored for the same reason, and the procedure is recorded in
+  [the Phase 6 guide](phase-6-orchestration.md#building-the-deployable-artifact).
+
 ## Verification commands
 
 ```powershell
@@ -37,15 +70,16 @@ python -m ruff check .
 sam validate --lint --template-file infra/template.yaml --region us-east-1
 ```
 
-Focused result at implementation time: **15 passed**. Full suite: **224 passed, 7 skipped** before
-the absolute-workspace regression assertion was added; the final full-suite result is recorded in
-the project status report. The four opt-in real-scanner integration tests also pass. Ruff and SAM
-validation are clean.
+Focused result at implementation time: **15 passed**. Full suite at that point: **224 passed,
+7 skipped**; after the Phase 7 work recorded separately, the same suite is **257 passed, 7 skipped**.
+The four opt-in real-scanner integration tests also pass. Ruff and SAM validation are clean.
 
 ## Not verified
 
 - A deployed Step Functions execution, Lambda retry, EventBridge failure event, DynamoDB/S3
   conditional race, or SQS delivery in a real AWS account.
-- Packaging Gitleaks, Semgrep, and Checkov into the hosted detect Lambda.
+- Packaging Gitleaks, Semgrep, and Checkov into the hosted detect Lambda: the container build
+  proves the Python dependencies and the handler imports, not that the scanner executables are
+  present on the Lambda filesystem.
 - A live ambiguous Strands turn through Claude/Bedrock. Direct deterministic Strands tool
   invocation is verified; mocked provider shapes remain covered by Phase 5 tests.
