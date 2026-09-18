@@ -1,61 +1,59 @@
 # First Commit
 
-Phase 4 finding-policy evaluation is available through `first-commit policy`.
-See [the Cedar policy guide](docs/phase-4-policy.md) for context, cache, limits,
-decision semantics and the Phase 5 handoff.
-
-Governance and IAM proposal commands are now available. See
-[the Phase 2–3 guide](docs/phase-2-3.md) for commands, tested failure handling,
-and explicit remaining runtime-validation work.
-
-First Commit is an evidence-first safety companion for AI-generated code. It
-uses deterministic scanners to find concrete shipping risks before invoking an
-AI explanation layer in a later phase. It never executes scanned code and it
-never directly commits, merges, or deploys a remediation.
+First Commit is an evidence-first safety companion for AI-generated code.
+Deterministic scanners and embedded Cedar policies decide first; an AI
+explanation layer comes in a later phase. It never executes scanned code, and it
+never commits, merges or deploys a fix.
 
 ## What works today
 
-Phase 0 and Phase 1 provide a local Python CLI that:
+Phases follow the [master technical reference](first-commit-master-technical-reference.md).
 
-- enforces file-count, file-size, total-size, nesting-depth, and scan-time limits;
-- invokes Gitleaks, Semgrep, and Checkov when installed;
-- runs first-party static checks for missing required environment variables,
-  missing route authorization, and missing request validation;
-- converts all detector output into one versioned `Finding` schema;
-- fingerprints findings and scan inputs deterministically for later caching.
-
-The external tools are intentionally not reimplemented. If one is unavailable,
-the CLI records a clear partial-scan error and exits non-zero; it never claims a
-clean result. First-party checks cover product-specific patterns that are not
-well represented by an off-the-shelf rule alone.
+| Phase | Capability | Commands |
+| --- | --- | --- |
+| 0–1. Product and scan engine | Repository contract, threat model, CI, seeded fixtures, deterministic versioned findings and content-hash cache | `scan` |
+| 2–3. Intake and candidate validation | Directory, bounded `.zip` or hardened HTTPS Git URL; Gitleaks, Semgrep, Checkov and first-party checks; reviewed IAM proposals and sandboxed local candidate validation | `scan`, `propose-iam`, `validate-candidate` |
+| 4. Policy engine and control plane | Embedded Cedar triage plus policy-version audit; local SQLite and DynamoDB adapters for scans, findings, decisions, and deployment attempts; SAM API/workflow foundation | `policy` |
+Not built yet: browser dashboard implementation, Bedrock explanations, IAM
+Access Analyzer proof, real AWS deployment and tracing integrations. See
+[the architecture](docs/architecture.md), [the Phase 3 guide](docs/phase-3.md)
+and [the Phase 4 guide](docs/phase-4-policy.md).
 
 ## Quick start
 
-Prerequisites: Python 3.12+, plus [Gitleaks](https://github.com/gitleaks/gitleaks),
-[Semgrep](https://github.com/semgrep/semgrep), and
-[Checkov](https://github.com/bridgecrewio/checkov) on `PATH`.
+Prerequisites: Python 3.12+, and Gitleaks, Semgrep and Checkov either on `PATH`
+or installed under `.tools/<name>`. Runtime validation also needs Docker, the
+SAM CLI and the three images pinned in `agent/candidate_runtime.py`.
 
 ```powershell
 python -m venv .venv
 .\.venv\Scripts\Activate.ps1
 pip install -e ".[dev]"
+first-commit doctor
 first-commit scan fixtures/golden-repo
 pytest
 ruff check .
 ```
 
-Use `first-commit scan fixtures/hostile-repo` to verify safe rejection of a
-hostile input. Run `first-commit scan --help` for machine-readable JSON output
-options and limits.
+Tests that drive the real scanners and Docker are opt-in:
+
+```powershell
+$env:FIRST_COMMIT_INTEGRATION = "1"
+pytest agent/tests/test_scanner_integration.py agent/tests/test_candidate_runtime.py
+```
 
 ## Safety contract
 
-- Scanned code is read as data only; it is never imported, built, or executed.
-- Files outside the submitted root are never traversed.
-- Binary files are skipped and reported; detector commands receive only the
-  target directory and run under a hard timeout.
-- A missing detector is a partial/failed scan, not a passing scan.
-- Findings are evidence, not automatic fixes. Future remediation is PR-only.
+- Scanning reads input as data; nothing is imported, built or executed.
+- A scanned repository cannot configure or suppress the scanners.
+- Files outside the submitted root are never traversed; links, path escapes
+  and zip bombs are rejected.
+- A missing, crashed or unmapped detector makes a scan partial, never clean.
+- Candidate code runs only inside the container sandbox of
+  [ADR 0007](docs/ADRs/0007-candidate-sandbox-and-untrusted-scanner-config.md),
+  driven by trusted operator manifests.
+- Fixes are proposals. A PR requires static and runtime evidence plus a bound
+  human approval.
 
 See [docs/threat-model.md](docs/threat-model.md), [CONTRIBUTING.md](CONTRIBUTING.md),
 and [the ADRs](docs/ADRs/) for the project contract.
