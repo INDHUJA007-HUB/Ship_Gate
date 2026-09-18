@@ -1,0 +1,11 @@
+{
+  "template": "template.yaml",
+  "function": "Reader",
+  "event": {},
+  "expected": {"statusCode": 200, "title": "hello", "body": "hello"},
+  "environment": {"DDB_ENDPOINT": "http://ddb:8000", "S3_ENDPOINT": "http://minio:9000"},
+  "seed": {
+    "dynamodb": [{"table": "photos", "key": "id", "items": [{"id": "demo", "title": "hello"}]}],
+    "s3": [{"bucket": "photos", "objects": {"demo.txt": "hello"}}]
+  }
+}

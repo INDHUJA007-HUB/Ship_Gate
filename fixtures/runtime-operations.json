@@ -1,0 +1,4 @@
+[
+  {"action": "s3:GetObject", "resource": "arn:aws:s3:::photos/demo.txt"},
+  {"action": "dynamodb:GetItem", "resource": "arn:aws:dynamodb:us-east-1:000000000000:table/photos"}
+]
