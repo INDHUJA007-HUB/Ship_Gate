@@ -71,11 +71,9 @@ these are represented as passing checks.
 | AWS quotas, rollback, accounts, tracing, budgets | Cloud phases; not provisioned or claimed here |
 | Hosted tenant isolation/authentication | Not implemented; local checks aren't an API security boundary |
 
-## Remaining phase exit criteria
+## Status
 
-Phase 2's local Cedar decision engine is implemented and exercised against the
-real native library. Phase 3's safe proposal/static-validation path is
-implemented; the full phase is incomplete until candidate sandbox replay with
-SAM, DynamoDB Local and MinIO runs and the supported patch formats are expanded.
-The runtime machine must have Docker and SAM. Broader framework coverage and
-AWS semantics cannot be guaranteed by a static subset proof.
+Historical. Candidate replay with SAM, DynamoDB Local and MinIO now runs, and
+SAM/CloudFormation YAML proposals are supported. The "not yet implemented" list
+above predates that work; see [the Phase 3 completion guide](phase-3.md) for
+current commands, evidence and limits.
