@@ -29,7 +29,7 @@ class ScanCache:
             data = json.loads(path.read_text(encoding="utf-8"))
             if data.get("schema_version") != SCHEMA_VERSION or not data.get("complete"):
                 return None
-            findings = tuple(_finding(item) for item in data["findings"])
+            findings = tuple(finding_from_dict(item) for item in data["findings"])
             return ScanReport(
                 SCHEMA_VERSION, data["source"], content_hash, findings, (), cached=True
             )
@@ -48,7 +48,20 @@ class ScanCache:
         temporary.replace(target)
 
 
-def _finding(item: dict) -> Finding:
+def report_from_dict(data: dict) -> ScanReport:
+    """Rebuild a saved `first-commit scan` report; rejects other schema versions."""
+    if data["schema_version"] != SCHEMA_VERSION:
+        raise ValueError("Unsupported finding schema")
+    return ScanReport(
+        data["schema_version"],
+        data["source"],
+        data["content_hash"],
+        tuple(finding_from_dict(f) for f in data["findings"]),
+        tuple(data["detector_errors"]),
+    )
+
+
+def finding_from_dict(item: dict) -> Finding:
     location = item["location"]
     evidence = item["evidence"]
     return Finding(

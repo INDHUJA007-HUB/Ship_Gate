@@ -2,6 +2,13 @@ AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: First Commit serverless control plane. Mode selects adapters, never a second template.
 
+Metadata:
+  cfn-lint:
+    config:
+      # W1030 resolves the empty BedrockInferenceResourceArns default, but that list is only used
+      # when UseBedrock is true, and the BedrockRequiresModelArns rule rejects it being empty then.
+      ignore_checks: [W1030]
+
 Parameters:
   Mode:
     Type: String
@@ -12,6 +19,38 @@ Parameters:
     Default: 7
     MinValue: 1
     MaxValue: 30
+  ModelProvider:
+    Type: String
+    Default: none
+    AllowedValues: [none, bedrock]
+    Description: none renders vetted templates only; bedrock calls Claude in Amazon Bedrock.
+  BedrockInferenceResourceArns:
+    Type: CommaDelimitedList
+    Default: ''
+    Description: >-
+      Exact model resource ARNs the explain worker may invoke through
+      bedrock-mantle:CreateInference (small and large tier, plus the refusal fallback model).
+
+  FaultInjection:
+    Type: String
+    Default: disabled
+    AllowedValues: [disabled, enabled]
+    Description: Chaos testing only. Enables operator-set step faults; never enable in production.
+  FaultSpecs:
+    Type: String
+    Default: ''
+    AllowedPattern: '^([a-z][a-z0-9-]{0,39}=[a-z_]+(:[1-9])?(,[a-z][a-z0-9-]{0,39}=[a-z_]+(:[1-9])?)*)?$'
+    Description: Comma-separated STEP=KIND[:N] faults, read only when FaultInjection is enabled.
+
+Conditions:
+  UseBedrock: !Equals [!Ref ModelProvider, bedrock]
+
+Rules:
+  BedrockRequiresModelArns:
+    RuleCondition: !Equals [!Ref ModelProvider, bedrock]
+    Assertions:
+      - Assert: !Not [!Contains [!Ref BedrockInferenceResourceArns, '']]
+        AssertDescription: BedrockInferenceResourceArns must list model ARNs when ModelProvider is bedrock.
 
 Globals:
   Function:
@@ -25,6 +64,9 @@ Globals:
         FIRST_COMMIT_MODE: !Ref Mode
         FIRST_COMMIT_TABLE_NAME: !Ref ControlPlaneTable
         FIRST_COMMIT_ARCHIVE_BUCKET: !Ref RepoArchiveBucket
+        FIRST_COMMIT_REVIEW_QUEUE_URL: !Ref ReviewQueue
+        FIRST_COMMIT_FAULT_INJECTION: !Ref FaultInjection
+        FIRST_COMMIT_FAULTS: !Ref FaultSpecs
         LOG_LEVEL: INFO
 
 Resources:
@@ -66,6 +108,16 @@ Resources:
       OwnershipControls:
         Rules: [{ObjectOwnership: BucketOwnerEnforced}]
 
+  # The dead-letter path for human review. FIFO deduplication on the review ID means a retried
+  # incident step never notifies twice; DynamoDB keeps the durable record.
+  ReviewQueue:
+    Type: AWS::SQS::Queue
+    Properties:
+      FifoQueue: true
+      ContentBasedDeduplication: false
+      SqsManagedSseEnabled: true
+      MessageRetentionPeriod: 1209600
+
   UserPool:
     Type: AWS::Cognito::UserPool
     Properties:
@@ -88,7 +140,7 @@ Resources:
     Properties:
       CorsConfiguration:
         AllowOrigins: ['http://localhost:5173']
-        AllowHeaders: [authorization, content-type, x-first-commit-tenant]
+        AllowHeaders: [authorization, content-type, idempotency-key]
         AllowMethods: [POST, GET]
       Auth:
         Authorizers:
@@ -106,12 +158,12 @@ Resources:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
       Policies:
-        - PolicyName: api-control-plane-only
+        - PolicyName: api-runs-only
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
                 Resource: !GetAtt ControlPlaneTable.Arn
               - Effect: Allow
                 Action: states:StartExecution
@@ -120,23 +172,110 @@ Resources:
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
                 Resource: '*'
 
-  ScanWorkerRole:
+  # One role per pipeline step. S3 prefixes: uploads (read by Prepare), snapshots (written by
+  # Prepare, read by Detect) and checkpoints (write-once step artifacts). s3:ListBucket makes a
+  # missing checkpoint a 404 instead of a 403, which the adapters rely on.
+  PipelinePrepareRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
       Policies:
-        - PolicyName: scan-worker-archive-and-findings
+        - PolicyName: pipeline-prepare
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [s3:GetObject, s3:DeleteObject]
-                Resource: !Sub '${RepoArchiveBucket.Arn}/tenant/*'
+                Action: s3:GetObject
+                Resource: [!Sub '${RepoArchiveBucket.Arn}/tenant/*/uploads/*', !Sub '${RepoArchiveBucket.Arn}/tenant/*/checkpoints/*']
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${RepoArchiveBucket.Arn}/tenant/*/snapshots/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt RepoArchiveBucket.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+
+  PipelineDetectRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: pipeline-detect
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: s3:GetObject
+                Resource: [!Sub '${RepoArchiveBucket.Arn}/tenant/*/snapshots/*', !Sub '${RepoArchiveBucket.Arn}/tenant/*/checkpoints/*']
+              - Effect: Allow
+                Action: s3:PutObject
+                Resource: !Sub '${RepoArchiveBucket.Arn}/tenant/*/checkpoints/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt RepoArchiveBucket.Arn
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ReviewQueue.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+
+  PipelineIncidentRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: pipeline-incident
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: dynamodb:PutItem
+                Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ReviewQueue.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+
+  PipelineMergeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: pipeline-merge
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${RepoArchiveBucket.Arn}/tenant/*/checkpoints/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt RepoArchiveBucket.Arn
               - Effect: Allow
                 Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
                 Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: sqs:SendMessage
+                Resource: !GetAtt ReviewQueue.Arn
               - Effect: Allow
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
                 Resource: '*'
@@ -153,8 +292,70 @@ Resources:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
-                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${RepoArchiveBucket.Arn}/tenant/*/checkpoints/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt RepoArchiveBucket.Arn
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:DeleteItem, dynamodb:Query]
                 Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+        - !If
+          - UseBedrock
+          - PolicyName: explain-worker-model-inference
+            PolicyDocument:
+              Version: '2012-10-17'
+              Statement:
+                - Effect: Allow
+                  Action: bedrock-mantle:CreateInference
+                  Resource: !Ref BedrockInferenceResourceArns
+          - !Ref AWS::NoValue
+
+  PipelineFinalizeRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: pipeline-finalize
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:PutObject]
+                Resource: !Sub '${RepoArchiveBucket.Arn}/tenant/*/checkpoints/*'
+              - Effect: Allow
+                Action: s3:ListBucket
+                Resource: !GetAtt RepoArchiveBucket.Arn
+              - Effect: Allow
+                # Runs and scan status, plus the explanation cache for the no-model template fallback.
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:DeleteItem]
+                Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+
+  ExecutionStatusRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: execution-status-runs-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem]
+                Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: states:DescribeExecution
+                Resource: !Sub 'arn:${AWS::Partition}:states:${AWS::Region}:${AWS::AccountId}:execution:*'
               - Effect: Allow
                 Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
                 Resource: '*'
@@ -189,23 +390,79 @@ Resources:
       Events:
         StartScan:
           Type: HttpApi
-          Properties:
-            ApiId: !Ref HttpApi
-            Path: /scans
-            Method: POST
+          Properties: {ApiId: !Ref HttpApi, Path: /scans, Method: POST}
         GetScan:
           Type: HttpApi
-          Properties:
-            ApiId: !Ref HttpApi
-            Path: '/scans/{scan_id}'
-            Method: GET
+          Properties: {ApiId: !Ref HttpApi, Path: '/scans/{scan_id}', Method: GET}
+        GetRun:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: '/runs/{run_id}', Method: GET}
+        ResumeRun:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: '/runs/{run_id}/resume', Method: POST}
+        ListReviewItems:
+          Type: HttpApi
+          Properties: {ApiId: !Ref HttpApi, Path: '/runs/{run_id}/review-items', Method: GET}
 
-  ScanWorker:
+  # Each Lambda timeout sits below its task's TimeoutSeconds in the state machine, so a stuck
+  # function surfaces as Sandbox.Timedout (retried where the definition says) first. External
+  # scanners must be packaged with the detect function (a layer or container image); without
+  # them those checks report tool_unavailable and the run is labeled partial.
+  PipelinePrepareFunction:
     Type: AWS::Serverless::Function
-    Properties: {CodeUri: ../, Handler: api.handlers.scan_worker_handler, Role: !GetAtt ScanWorkerRole.Arn, Timeout: 300, MemorySize: 1024}
+    Properties:
+      CodeUri: ../
+      Handler: api.handlers.pipeline_prepare_handler
+      Role: !GetAtt PipelinePrepareRole.Arn
+      Timeout: 300
+      MemorySize: 1024
+      EphemeralStorage: {Size: 1024}
+  PipelineDetectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../
+      Handler: api.handlers.pipeline_detect_handler
+      Role: !GetAtt PipelineDetectRole.Arn
+      Timeout: 300
+      MemorySize: 2048
+      EphemeralStorage: {Size: 1024}
+  PipelineIncidentFunction:
+    Type: AWS::Serverless::Function
+    Properties: {CodeUri: ../, Handler: api.handlers.pipeline_incident_handler, Role: !GetAtt PipelineIncidentRole.Arn, Timeout: 30, MemorySize: 256}
+  PipelineMergeFunction:
+    Type: AWS::Serverless::Function
+    Properties: {CodeUri: ../, Handler: api.handlers.pipeline_merge_handler, Role: !GetAtt PipelineMergeRole.Arn, Timeout: 90, MemorySize: 1024}
   ExplainWorker:
     Type: AWS::Serverless::Function
-    Properties: {CodeUri: ../, Handler: api.handlers.explain_worker_handler, Role: !GetAtt ExplainWorkerRole.Arn}
+    Properties:
+      CodeUri: ../
+      Handler: api.handlers.pipeline_explain_handler
+      Role: !GetAtt ExplainWorkerRole.Arn
+      # Up to three bounded model calls per scan, each with SDK retries.
+      Timeout: 300
+      Environment:
+        Variables:
+          FIRST_COMMIT_MODEL_PROVIDER: !Ref ModelProvider
+  PipelineFinalizeFunction:
+    Type: AWS::Serverless::Function
+    Properties: {CodeUri: ../, Handler: api.handlers.pipeline_finalize_handler, Role: !GetAtt PipelineFinalizeRole.Arn, Timeout: 90, MemorySize: 512}
+  ExecutionStatusFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../
+      Handler: api.handlers.execution_status_handler
+      Role: !GetAtt ExecutionStatusRole.Arn
+      MemorySize: 256
+      Events:
+        AbnormalExecutionEnd:
+          Type: EventBridgeRule
+          Properties:
+            Pattern:
+              source: [aws.states]
+              detail-type: [Step Functions Execution Status Change]
+              detail:
+                status: [FAILED, TIMED_OUT, ABORTED]
+                stateMachineArn: [!Ref ScanWorkflow]
   DeployWorker:
     Type: AWS::Serverless::Function
     Properties: {CodeUri: ../, Handler: api.handlers.deploy_worker_handler, Role: !GetAtt DeployWorkerRole.Arn}
@@ -217,34 +474,44 @@ Resources:
         Version: '2012-10-17'
         Statement: [{Effect: Allow, Principal: {Service: states.amazonaws.com}, Action: 'sts:AssumeRole'}]
       Policies:
-        - PolicyName: workflow-invoke-workers
+        - PolicyName: workflow-invoke-pipeline-steps
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action: lambda:InvokeFunction
-                Resource: [!GetAtt ScanWorker.Arn, !GetAtt ExplainWorker.Arn]
+                Resource:
+                  - !GetAtt PipelinePrepareFunction.Arn
+                  - !GetAtt PipelineDetectFunction.Arn
+                  - !GetAtt PipelineIncidentFunction.Arn
+                  - !GetAtt PipelineMergeFunction.Arn
+                  - !GetAtt ExplainWorker.Arn
+                  - !GetAtt PipelineFinalizeFunction.Arn
+              - Effect: Allow
+                Action: [xray:PutTraceSegments, xray:PutTelemetryRecords, xray:GetSamplingRules, xray:GetSamplingTargets]
+                Resource: '*'
 
+  # Standard, not Express: a scan can outlast the Express five-minute ceiling, and Standard keeps
+  # execution history for review and supports redrive. See docs/ADRs/0011.
   ScanWorkflow:
     Type: AWS::Serverless::StateMachine
     Properties:
-      Type: EXPRESS
+      Type: STANDARD
       Role: !GetAtt StepFunctionsRole.Arn
-      Definition:
-        StartAt: Scan
-        States:
-          Scan:
-            Type: Task
-            Resource: !GetAtt ScanWorker.Arn
-            Retry: [{ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException], IntervalSeconds: 2, MaxAttempts: 2, BackoffRate: 2}]
-            Next: Explain
-          Explain:
-            Type: Task
-            Resource: !GetAtt ExplainWorker.Arn
-            End: true
+      Tracing: {Enabled: true}
+      DefinitionUri: ../agent/orchestration/scan-pipeline.asl.json
+      DefinitionSubstitutions:
+        PrepareFunctionArn: !GetAtt PipelinePrepareFunction.Arn
+        DetectFunctionArn: !GetAtt PipelineDetectFunction.Arn
+        IncidentFunctionArn: !GetAtt PipelineIncidentFunction.Arn
+        MergeFunctionArn: !GetAtt PipelineMergeFunction.Arn
+        ExplainFunctionArn: !GetAtt ExplainWorker.Arn
+        FinalizeFunctionArn: !GetAtt PipelineFinalizeFunction.Arn
 
 Outputs:
   ApiUrl: {Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'}
   TableName: {Value: !Ref ControlPlaneTable}
   ArchiveBucket: {Value: !Ref RepoArchiveBucket}
+  ReviewQueueUrl: {Value: !Ref ReviewQueue}
+  ScanWorkflowArn: {Value: !Ref ScanWorkflow}
   UserPoolId: {Value: !Ref UserPool}

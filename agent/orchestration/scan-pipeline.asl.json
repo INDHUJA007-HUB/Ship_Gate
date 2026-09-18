@@ -1,0 +1,261 @@
+{
+  "Comment": "First Commit scan pipeline (pipeline-1). Every task is idempotent. A failed detector becomes a labeled incomplete check and a review item, never a discarded scan; invalid input fails the scan with a reason code.",
+  "TimeoutSeconds": 3600,
+  "StartAt": "Prepare",
+  "States": {
+    "Prepare": {
+      "Type": "Task",
+      "Comment": "Validate the request, ingest and preflight the source, store its snapshot, plan applicable detectors or reuse an identical completed result.",
+      "Resource": "${PrepareFunctionArn}",
+      "Parameters": {
+        "request.$": "$",
+        "attempt.$": "$$.State.RetryCount"
+      },
+      "ResultPath": "$.prepare",
+      "TimeoutSeconds": 330,
+      "Retry": [
+        {
+          "ErrorEquals": ["TransientStepError", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "MaxDelaySeconds": 30,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.failure.prepare", "Next": "RecordPipelineFailure"}
+      ],
+      "Next": "RoutePrepared"
+    },
+    "RoutePrepared": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.prepare.outcome", "StringEquals": "planned", "Next": "Detect"}
+      ],
+      "Default": "Finalize"
+    },
+    "Detect": {
+      "Type": "Map",
+      "Comment": "Detectors run independently. Transient failures retry; a timeout retries once; anything else is dead-lettered and reported as an incomplete check.",
+      "ItemsPath": "$.prepare.detectors",
+      "MaxConcurrency": 5,
+      "ItemSelector": {
+        "run.$": "$.prepare.run",
+        "detector.$": "$$.Map.Item.Value"
+      },
+      "ItemProcessor": {
+        "ProcessorConfig": {"Mode": "INLINE"},
+        "StartAt": "RunDetector",
+        "States": {
+          "RunDetector": {
+            "Type": "Task",
+            "Resource": "${DetectFunctionArn}",
+            "Parameters": {
+              "run.$": "$.run",
+              "detector.$": "$.detector",
+              "attempt.$": "$$.State.RetryCount"
+            },
+            "TimeoutSeconds": 330,
+            "Retry": [
+              {
+                "ErrorEquals": ["TransientStepError", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 30,
+                "JitterStrategy": "FULL"
+              },
+              {
+                "ErrorEquals": ["DetectorTimeout", "States.Timeout", "Sandbox.Timedout"],
+                "IntervalSeconds": 5,
+                "MaxAttempts": 1
+              }
+            ],
+            "Catch": [
+              {"ErrorEquals": ["States.ALL"], "ResultPath": "$.error", "Next": "RecordIncompleteCheck"}
+            ],
+            "End": true
+          },
+          "RecordIncompleteCheck": {
+            "Type": "Task",
+            "Resource": "${IncidentFunctionArn}",
+            "Parameters": {
+              "run.$": "$.run",
+              "detector.$": "$.detector",
+              "error.$": "$.error"
+            },
+            "TimeoutSeconds": 60,
+            "Retry": [
+              {
+                "ErrorEquals": ["TransientStepError", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+                "IntervalSeconds": 2,
+                "MaxAttempts": 3,
+                "BackoffRate": 2,
+                "MaxDelaySeconds": 30,
+                "JitterStrategy": "FULL"
+              }
+            ],
+            "Catch": [
+              {"ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "IncompleteCheckUnrecorded"}
+            ],
+            "End": true
+          },
+          "IncompleteCheckUnrecorded": {
+            "Type": "Pass",
+            "Comment": "Even when the review record cannot be written, the check is still reported incomplete.",
+            "Parameters": {
+              "detector.$": "$.detector.name",
+              "status": "incomplete",
+              "reason": "incident_not_recorded",
+              "disposition": "human_review",
+              "review_id": null
+            },
+            "End": true
+          }
+        }
+      },
+      "ResultPath": "$.checks",
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.failure.detect", "Next": "RecordPipelineFailure"}
+      ],
+      "Next": "Merge"
+    },
+    "Merge": {
+      "Type": "Task",
+      "Comment": "Merge checkpointed findings with content-derived IDs, record them with conditional writes and evaluate Cedar policy.",
+      "Resource": "${MergeFunctionArn}",
+      "Parameters": {
+        "run.$": "$.prepare.run",
+        "planned.$": "$.prepare.detectors",
+        "skipped.$": "$.prepare.skipped",
+        "checks.$": "$.checks",
+        "attempt.$": "$$.State.RetryCount"
+      },
+      "ResultPath": "$.merge",
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": ["TransientStepError", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "MaxDelaySeconds": 30,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.failure.merge", "Next": "RecordPipelineFailure"}
+      ],
+      "Next": "RouteMerged"
+    },
+    "RouteMerged": {
+      "Type": "Choice",
+      "Comment": "No findings means nothing to explain: skip the model step entirely.",
+      "Choices": [
+        {"Variable": "$.merge.counts.findings", "NumericEquals": 0, "Next": "Finalize"}
+      ],
+      "Default": "Explain"
+    },
+    "Explain": {
+      "Type": "Task",
+      "Comment": "Phase 5 explanations. A failure here degrades to vetted templates in Finalize; it never fails the scan.",
+      "Resource": "${ExplainFunctionArn}",
+      "Parameters": {
+        "run.$": "$.prepare.run",
+        "merge.$": "$.merge",
+        "attempt.$": "$$.State.RetryCount"
+      },
+      "ResultPath": "$.explain",
+      "TimeoutSeconds": 330,
+      "Retry": [
+        {
+          "ErrorEquals": ["TransientStepError", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 5,
+          "MaxAttempts": 2,
+          "BackoffRate": 3,
+          "MaxDelaySeconds": 60,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.explain_failure", "Next": "ExplanationUnavailable"}
+      ],
+      "Next": "Finalize"
+    },
+    "ExplanationUnavailable": {
+      "Type": "Pass",
+      "Parameters": {"status": "unavailable"},
+      "ResultPath": "$.explain",
+      "Next": "Finalize"
+    },
+    "RecordPipelineFailure": {
+      "Type": "Task",
+      "Comment": "Dead-letter a step that failed the pipeline; completed checkpoints stay for a resume.",
+      "Resource": "${IncidentFunctionArn}",
+      "Parameters": {"state.$": "$"},
+      "ResultPath": "$.incident",
+      "TimeoutSeconds": 60,
+      "Retry": [
+        {
+          "ErrorEquals": ["TransientStepError", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "MaxDelaySeconds": 30,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": null, "Next": "Finalize"}
+      ],
+      "Next": "Finalize"
+    },
+    "Finalize": {
+      "Type": "Task",
+      "Comment": "Assemble the labeled result, record the run outcome and scan status.",
+      "Resource": "${FinalizeFunctionArn}",
+      "Parameters": {
+        "state.$": "$",
+        "attempt.$": "$$.State.RetryCount"
+      },
+      "ResultPath": "$.result",
+      "TimeoutSeconds": 120,
+      "Retry": [
+        {
+          "ErrorEquals": ["TransientStepError", "Lambda.ServiceException", "Lambda.AWSLambdaException", "Lambda.SdkClientException", "Lambda.TooManyRequestsException"],
+          "IntervalSeconds": 2,
+          "MaxAttempts": 3,
+          "BackoffRate": 2,
+          "MaxDelaySeconds": 30,
+          "JitterStrategy": "FULL"
+        }
+      ],
+      "Catch": [
+        {"ErrorEquals": ["States.ALL"], "ResultPath": "$.finalize_failure", "Next": "FinalizeFailed"}
+      ],
+      "Next": "RouteOutcome"
+    },
+    "RouteOutcome": {
+      "Type": "Choice",
+      "Choices": [
+        {"Variable": "$.result.status", "StringEquals": "failed", "Next": "ScanFailed"}
+      ],
+      "Default": "Done"
+    },
+    "Done": {
+      "Type": "Succeed",
+      "OutputPath": "$.result"
+    },
+    "ScanFailed": {
+      "Type": "Fail",
+      "Error": "ScanFailed",
+      "CausePath": "$.result.reason"
+    },
+    "FinalizeFailed": {
+      "Type": "Fail",
+      "Error": "FinalizeFailed",
+      "Cause": "The run outcome could not be recorded. The execution status rule marks the run failed."
+    }
+  }
+}

@@ -1,5 +1,6 @@
 import json
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -38,6 +39,8 @@ def test_local_and_aws_adapter_selection(monkeypatch, tmp_path):
     with pytest.raises(ValueError):
         load_adapters("aws")
     monkeypatch.setenv("FIRST_COMMIT_TABLE_NAME", "table")
+    monkeypatch.setenv("FIRST_COMMIT_ARCHIVE_BUCKET", "bucket")
+    monkeypatch.setenv("AWS_DEFAULT_REGION", "us-east-1")
     assert load_adapters("aws").mode == "aws"
     with pytest.raises(ValueError):
         load_adapters("unknown")
@@ -106,19 +109,35 @@ def test_policy_decisions_share_the_store_boundary(tmp_path):
 
 
 def test_api_async_contract(monkeypatch, tmp_path):
+    import shutil
+
     import api.handlers as handlers
 
+    source = tmp_path / "repo"
+    shutil.copytree(Path(__file__).parents[2] / "fixtures" / "golden-repo", source)
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("FIRST_COMMIT_MODE", "local")
+    monkeypatch.setenv("FIRST_COMMIT_MODEL_PROVIDER", "none")
+    monkeypatch.setattr(handlers, "_CONTEXT", None)
+    monkeypatch.setenv("FIRST_COMMIT_EXTERNAL_DETECTORS", "off")
     event = {
-        "body": json.dumps({"source_ref": "https://github.com/example/repo"}),
-        "headers": {"x-first-commit-tenant": "tenant"},
+        "body": json.dumps({"source_ref": str(source), "environments": ["development"]}),
+        "headers": {"x-first-commit-tenant": "tenant", "Idempotency-Key": "client-key-0001"},
         "requestContext": {"http": {"method": "POST", "path": "/scans"}},
     }
     result = handlers.router_handler(event, None)
     body = json.loads(result["body"])
-    assert result["statusCode"] == 202
-    assert body["status"] == "queued" and body["execution_id"].startswith("local-")
-    event["requestContext"]["http"] = {"method": "GET", "path": f"/scans/{body['scan_id']}"}
-    event["pathParameters"] = {"scan_id": body["scan_id"]}
-    assert handlers.router_handler(event, None)["statusCode"] == 200
+    assert result["statusCode"] == 202, body
+    assert body["run_id"].startswith("run-") and body["status"] in {"completed", "partial"}
+    replay = json.loads(handlers.router_handler(event, None)["body"])
+    assert replay["run_id"] == body["run_id"]  # The idempotency key names the same run.
+    status = {
+        "headers": {"x-first-commit-tenant": "tenant"},
+        "requestContext": {"http": {"method": "GET", "path": f"/runs/{body['run_id']}"}},
+        "pathParameters": {"run_id": body["run_id"]},
+    }
+    assert handlers.router_handler(status, None)["statusCode"] == 200
+    status["headers"] = {"x-first-commit-tenant": "other"}
+    assert handlers.router_handler(status, None)["statusCode"] == 404
+    del status["headers"]
+    assert handlers.router_handler(status, None)["statusCode"] == 401
