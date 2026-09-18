@@ -426,14 +426,24 @@ Resources:
       EphemeralStorage: {Size: 1024}
   PipelineDetectFunction:
     Type: AWS::Serverless::Function
-    Metadata: {BuildMethod: python3.12}
+    Metadata:
+      Dockerfile: infra/detect.Dockerfile
+      DockerContext: ../
+      DockerTag: python3.12-v1
     Properties:
-      CodeUri: ../
-      Handler: api.handlers.pipeline_detect_handler
+      PackageType: Image
       Role: !GetAtt PipelineDetectRole.Arn
       Timeout: 300
       MemorySize: 2048
       EphemeralStorage: {Size: 1024}
+      Environment:
+        Variables:
+          FIRST_COMMIT_GITLEAKS_BIN: /usr/local/bin/gitleaks
+          FIRST_COMMIT_SEMGREP_BIN: /var/lang/bin/semgrep
+          FIRST_COMMIT_CHECKOV_BIN: /var/lang/bin/checkov
+          SEMGREP_SEND_METRICS: "off"
+          CHECKOV_SKIP_MAPPING: "true"
+          NO_COLOR: "1"
   PipelineIncidentFunction:
     Type: AWS::Serverless::Function
     Metadata: {BuildMethod: python3.12}

@@ -31,6 +31,17 @@ def digest(value, length: int = 32) -> str:
     return hashlib.sha256(stable(value).encode()).hexdigest()[:length]
 
 
+def request_digest(request: dict) -> str:
+    """Stable digest of the semantic fields of a run request."""
+    return digest(
+        {
+            "source_ref": request.get("source_ref"),
+            "environments": sorted(set(request.get("environments", []))),
+            "audience": request.get("audience", "beginner"),
+        }
+    )
+
+
 def tenant_key(tenant: str) -> str:
     """Storage path segment. Raw tenant identifiers never become object keys."""
     return hashlib.sha256(f"tenant\0{tenant}".encode()).hexdigest()[:32]

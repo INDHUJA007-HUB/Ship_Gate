@@ -132,3 +132,83 @@ def test_late_event_from_older_generation_cannot_overwrite_current_run(monkeypat
     }
     assert handlers.execution_status_handler(event, None) == {"updated": False}
     assert state.get_run("tenant", run_id)["status"] == "running"
+
+
+def test_idempotency_same_digest_returns_original_run(tmp_path):
+    state = LocalPipelineState(tmp_path / "state")
+    client = Executions()
+    pipeline = StepFunctionsPipeline(
+        state, "arn:aws:states:region:account:stateMachine:test", client
+    )
+    run_id = new_run_id("tenant", "idemp-key-1")
+    req1 = hosted_request(run_id)
+    
+    first = pipeline.submit(req1)
+    second = pipeline.submit(req1)
+    
+    assert first["run_id"] == second["run_id"] == run_id
+    assert first["request_digest"] == second["request_digest"]
+    # Should only start one execution
+    assert len(client.started) == 1
+
+
+def test_idempotency_different_digest_rejects_new_request(tmp_path):
+    from agent.orchestration.contracts import InvalidRequest
+
+    state = LocalPipelineState(tmp_path / "state")
+    client = Executions()
+    pipeline = StepFunctionsPipeline(
+        state, "arn:aws:states:region:account:stateMachine:test", client
+    )
+    run_id = new_run_id("tenant", "idemp-key-2")
+    req1 = hosted_request(run_id)
+    req2 = hosted_request(run_id)
+    req2["environments"] = ["development"]  # different semantic field
+    
+    pipeline.submit(req1)
+    
+    import pytest
+    with pytest.raises(InvalidRequest) as exc:
+        pipeline.submit(req2)
+    assert str(exc.value) == "idempotency_key_reused_with_different_request"
+    # Still only one execution started
+    assert len(client.started) == 1
+
+
+def test_idempotency_legacy_record_validation(tmp_path):
+    from agent.orchestration.contracts import InvalidRequest
+    
+    state = LocalPipelineState(tmp_path / "state")
+    client = Executions()
+    pipeline = StepFunctionsPipeline(
+        state, "arn:aws:states:region:account:stateMachine:test", client
+    )
+    run_id = new_run_id("tenant", "legacy-key-3")
+    
+    # Create legacy run without request_digest
+    req1 = hosted_request(run_id)
+    state.create_run({
+        "tenant_id": req1["tenant_id"],
+        "user_id": req1["user_id"],
+        "run_id": run_id,
+        "request": {
+            "source_ref": req1["source_ref"],
+            "environments": req1["environments"],
+            "audience": req1["audience"],
+        },
+        "status": "queued",
+        "generation": 0,
+        "version": 0,
+    })
+    
+    # Same semantic fields should be accepted (or returned)
+    result = pipeline.submit(req1)
+    assert result["run_id"] == run_id
+    
+    # Different semantic fields should be rejected
+    req2 = hosted_request(run_id)
+    req2["source_ref"] = "https://github.com/example/other.git"
+    with pytest.raises(InvalidRequest) as exc:
+        pipeline.submit(req2)
+    assert str(exc.value) == "idempotency_key_reused_with_different_request"
+

@@ -21,6 +21,7 @@ from pathlib import Path
 from typing import Protocol
 
 from agent.orchestration.contracts import tenant_key
+from agent.store import paginate_query
 
 FINAL = {"completed", "partial", "failed"}
 
@@ -400,21 +401,23 @@ class AwsPipelineState:
         from boto3.dynamodb.conditions import Key
 
         prefix = f"REVIEW#{run_id}#" if run_id else "REVIEW#"
-        response = self.table.query(
+        items = paginate_query(
+            self.table,
             KeyConditionExpression=Key("PK").eq(self._pk(tenant)) & Key("SK").begins_with(prefix)
         )
-        return [json.loads(item["body"]) for item in response.get("Items", [])]
+        return [json.loads(item["body"]) for item in items]
 
     def resolve_reviews(self, tenant, run_id, step, generation):
         """Optimistically close older review records without erasing their audit history."""
         from boto3.dynamodb.conditions import Key
 
         prefix = f"REVIEW#{run_id}#"
-        response = self.table.query(
+        items = paginate_query(
+            self.table,
             KeyConditionExpression=Key("PK").eq(self._pk(tenant)) & Key("SK").begins_with(prefix)
         )
         resolved = 0
-        for record in response.get("Items", []):
+        for record in items:
             item = json.loads(record["body"])
             if (
                 item.get("step") != step

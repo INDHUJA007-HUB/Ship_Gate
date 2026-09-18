@@ -15,6 +15,24 @@ class ConflictError(RuntimeError):
     pass
 
 
+def paginate_query(table, max_pages: int = 100, **kwargs) -> list[dict]:
+    """Reusable, bounded pagination helper for DynamoDB."""
+    items = []
+    seen_keys = set()
+    for _ in range(max_pages):
+        response = table.query(**kwargs)
+        items.extend(response.get("Items", []))
+        last_key = response.get("LastEvaluatedKey")
+        if not last_key:
+            break
+        key_str = json.dumps(last_key, sort_keys=True)
+        if key_str in seen_keys:
+            break
+        seen_keys.add(key_str)
+        kwargs["ExclusiveStartKey"] = last_key
+    return items
+
+
 class ScanStore(Protocol):
     def create_scan(self, scan: Scan) -> bool: ...
     def get_scan(self, tenant_id: str, scan_id: str) -> Scan | None: ...
@@ -264,11 +282,12 @@ class DynamoScanStore:
     def get_findings(self, tenant_id, scan_id):
         from boto3.dynamodb.conditions import Key
 
-        result = self.client.query(
+        items = paginate_query(
+            self.client,
             KeyConditionExpression=Key("PK").eq(self._pk(tenant_id))
             & Key("SK").begins_with(f"FINDING#{scan_id}#")
         )
-        return [item["finding"] for item in result.get("Items", [])]
+        return [item["finding"] for item in items]
 
     def create_deployment(self, attempt):
         try:

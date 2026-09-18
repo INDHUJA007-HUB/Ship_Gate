@@ -24,6 +24,7 @@ from agent.orchestration.contracts import (
     InvalidRequest,
     execution_name,
     validate_request,
+    request_digest,
 )
 from agent.orchestration.faults import FaultPlan
 from agent.orchestration.snapshots import SnapshotWorkspace
@@ -48,12 +49,30 @@ def load_definition() -> dict:
     return json.loads(DEFINITION.read_text(encoding="utf-8"))
 
 
+def _validate_idempotency(existing: dict, request: dict) -> None:
+    req_digest = request_digest(request)
+    existing_digest = existing.get("request_digest")
+    if existing_digest is not None:
+        if existing_digest != req_digest:
+            raise InvalidRequest("idempotency_key_reused_with_different_request")
+    else:
+        # Legacy record check (compare semantic fields directly)
+        existing_req = existing.get("request", {})
+        if (
+            existing_req.get("source_ref") != request.get("source_ref")
+            or existing_req.get("environments") != request.get("environments")
+            or existing_req.get("audience") != request.get("audience")
+        ):
+            raise InvalidRequest("idempotency_key_reused_with_different_request")
+
+
 def new_run(request: dict, now: int) -> dict:
     return {
         "schema_version": RUN_SCHEMA,
         "tenant_id": request["tenant_id"],
         "user_id": request["user_id"],
         "run_id": request["run_id"],
+        "request_digest": request_digest(request),
         "request": {
             "source_ref": request["source_ref"],
             "environments": request["environments"],
@@ -147,10 +166,14 @@ class LocalPipeline:
     def submit(self, request: dict) -> dict:
         request = validate_request(request, mode=self.context.mode)
         state, now = self.context.state, int(self.context.clock())
-        if not state.create_run(new_run(request, now)):
+        
+        record = new_run(request, now)
+        if not state.create_run(record):
             existing = state.get_run(request["tenant_id"], request["run_id"])
-            if existing and existing["status"] in FINAL:
-                return existing  # An idempotent replay returns the recorded outcome.
+            if existing:
+                _validate_idempotency(existing, request)
+                if existing["status"] in FINAL:
+                    return existing  # An idempotent replay returns the recorded outcome.
         return self._execute(request)
 
     def resume(self, tenant: str, run_id: str) -> dict:
@@ -233,6 +256,8 @@ class StepFunctionsPipeline:
         request = validate_request(request, mode="aws")
         created = self.state.create_run(new_run(request, int(self.clock())))
         run = self.state.get_run(request["tenant_id"], request["run_id"])
+        if not created and run:
+            _validate_idempotency(run, request)
         if created or (run and run["status"] == "queued"):
             self._start(request)
         return self.state.get_run(request["tenant_id"], request["run_id"])
