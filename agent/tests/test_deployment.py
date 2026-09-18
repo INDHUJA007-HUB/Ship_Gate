@@ -208,3 +208,24 @@ def test_lock_released_on_poll_exception(deploy_service, mock_store, mock_cfn):
     with pytest.raises(Exception):
         deploy_service.poll_execution("TargetAppStack", "tenant-123", "dep-123")
     mock_store.release_lock.assert_called_with("tenant-123", "TargetAppStack")
+def test_poll_execution_fetches_real_failure_reason(deploy_service, mock_store, mock_cfn):
+    mock_cfn.describe_stacks.return_value = {
+        "Stacks": [{"StackStatus": "UPDATE_ROLLBACK_COMPLETE", "StackStatusReason": "Generic rollback message"}]
+    }
+    mock_cfn.describe_stack_events.return_value = {
+        "StackEvents": [
+            {"ResourceStatus": "UPDATE_FAILED", "ResourceStatusReason": "Real failure root cause"}
+        ]
+    }
+    
+    with pytest.raises(DeploymentError) as exc:
+        deploy_service.poll_execution("TargetAppStack", "tenant-123", "dep-123")
+        
+    assert "Real failure root cause" in str(exc.value)
+    
+    # Also verify it was logged to the store
+    from agent.domain import DeploymentStatus
+    calls = mock_store.set_deployment_status.call_args_list
+    failed_calls = [c for c in calls if (c.args[2] if len(c.args)>2 else c.kwargs.get("status")) == DeploymentStatus.ROLLED_BACK]
+    args, kwargs = failed_calls[-1]
+    assert kwargs.get("rollback_status") == "Real failure root cause"

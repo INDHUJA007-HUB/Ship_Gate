@@ -157,11 +157,11 @@ class DeployService:
                     # We do not release lock yet if smoke test is next. (Or wait, smoke test releases it!)
                     return "succeeded"
                 if 'ROLLBACK' in status and status.endswith('_COMPLETE'):
-                    reason = res['Stacks'][0].get('StackStatusReason', 'Rolled back')
+                    reason = self._get_stack_failure_reason(stack_name) or res['Stacks'][0].get('StackStatusReason', 'Rolled back')
                     self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.ROLLED_BACK, int(time.time()), rollback_status=reason)
                     raise DeploymentError("rolled_back", f"Deployment rolled back: {reason}")
                 if status.endswith('_FAILED'):
-                    reason = res['Stacks'][0].get('StackStatusReason', 'Failed')
+                    reason = self._get_stack_failure_reason(stack_name) or res['Stacks'][0].get('StackStatusReason', 'Failed')
                     self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status=reason)
                     raise DeploymentError("failed", f"Deployment failed: {reason}")
                     
@@ -172,6 +172,17 @@ class DeployService:
         except Exception:
             self.store.release_lock(tenant_id, stack_name)
             raise
+
+    def _get_stack_failure_reason(self, stack_name: str) -> str | None:
+        try:
+            events_res = self.client.describe_stack_events(StackName=stack_name)
+            for event in events_res.get('StackEvents', []):
+                status = event.get('ResourceStatus', '')
+                if status in ('UPDATE_FAILED', 'CREATE_FAILED'):
+                    return event.get('ResourceStatusReason')
+        except Exception:
+            pass
+        return None
 
     def run_smoke_test(self, endpoint: str | None, tenant_id: str, deployment_id: str, stack_name: str) -> bool:
         from agent.domain import DeploymentStatus
