@@ -95,6 +95,29 @@ first-commit orchestrate "scan fixtures/golden-repo" --tenant demo --user demo -
 Fault injection is an operator-only test facility. AWS reads fault specifications only when the
 deployment parameter explicitly enables it; a scan request cannot supply faults.
 
+## Building the deployable artifact
+
+The template pins `Runtime: python3.12`, and every function pins the same value as its
+`Metadata: {BuildMethod: python3.12}`. A native `sam build` installs dependencies with the host
+interpreter, which on a newer Python produces extension modules the runtime cannot import, so the
+artifact is built in SAM's official runtime image instead:
+
+```powershell
+# From a clean tree: a working copy also contains .venv/, .tools/ and .aws-sam/, and SAM copies
+# the whole CodeUri tree into the container.
+git ls-files -z | xargs -0 -I{} cp --parents {} C:/tmp/first-commit-build
+cd C:/tmp/first-commit-build
+sam build --use-container --template-file infra/template.yaml
+```
+
+The verified result on this host: `public.ecr.aws/sam/build-python3.12:latest-x86_64`, all nine
+functions built, 72 `cpython-312-x86_64-linux-gnu` extension modules and no Windows or cp313
+binaries, importing cleanly under `public.ecr.aws/lambda/python:3.12`.
+
+`requirements.txt` is the Lambda dependency manifest and must stay aligned with `pyproject.toml`,
+which the stable SAM builder does not read. A guard test compares the two, because a missing entry
+still builds and only fails when the packaged code imports it.
+
 ## Completion boundary
 
 The code, local acceptance tests, Strands dependency, SAM state machine, per-step IAM roles,
@@ -104,6 +127,7 @@ not that an account has accepted the roles or that external scanner binaries are
 detect Lambda. Those live checks remain unverified until a stack is deployed.
 
 Lambda Python dependencies are declared separately in `requirements.txt`, because the stable SAM
-builder does not consume the project package's `pyproject.toml` by default. The durable workspace
-always materializes an absolute scanner target; scanner subprocesses deliberately use a separate
-trusted working directory and must never resolve the target relative to it.
+builder does not consume the project package's `pyproject.toml` by default; a guard test keeps the
+two manifests aligned. The durable workspace always materializes an absolute scanner target;
+scanner subprocesses deliberately use a separate trusted working directory and must never resolve
+the target relative to it.
