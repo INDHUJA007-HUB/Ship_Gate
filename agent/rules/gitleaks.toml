@@ -1,0 +1,4 @@
+# Packaged Gitleaks configuration. Passed explicitly with --config so a scanned
+# repository's own .gitleaks.toml can never replace or allowlist these rules.
+[extend]
+useDefault = true

@@ -23,6 +23,7 @@ class FindingType(StrEnum):
     MISSING_AUTH = "missing_auth"
     MISSING_INPUT_VALIDATION = "missing_input_validation"
     MISSING_ENVIRONMENT_VARIABLE = "missing_environment_variable"
+    UNSAFE_COMMAND_EXECUTION = "unsafe_command_execution"
 
 
 @dataclass(frozen=True, slots=True)

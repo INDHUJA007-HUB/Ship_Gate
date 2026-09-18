@@ -3,12 +3,14 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Iterable
 from pathlib import Path
 
 from agent.models import DetectorResult, FindingType, Severity
 from agent.normalize import normalized_finding
 
 PYTHON_SUFFIXES = {".py"}
+DECLARATION_SUFFIXES = {".yaml", ".yml", ".json"}
 ENV_PATTERN = re.compile(r"os\.environ\s*\[\s*['\"]([A-Z][A-Z0-9_]*)['\"]\s*\]")
 ROUTE_PATTERN = re.compile(r"^\s*@(?:\w+\.)?(?:get|post|put|patch|delete|route)\(")
 AUTH_PATTERN = re.compile(r"(?:require_auth|login_required|authorize|current_user)")
@@ -19,33 +21,37 @@ VALIDATION_PATTERN = re.compile(r"(?:BaseModel|validate\(|[Ss]chema\.load|jsonsc
 DECLARED_ENV_PATTERN = re.compile(r"^\s*([A-Z][A-Z0-9_]+)\s*:", re.MULTILINE)
 
 
-def _text_files(root: Path) -> list[Path]:
-    return [
-        path
-        for path in root.rglob("*")
-        if path.is_file() and not path.is_symlink() and path.suffix in PYTHON_SUFFIXES
-    ]
+def _candidates(root: Path, files: Iterable[Path] | None) -> list[Path]:
+    # Prefer the bounded, binary-free preflight list over a second, unbounded tree walk.
+    paths = root.rglob("*") if files is None else files
+    return [path for path in paths if path.is_file() and not path.is_symlink()]
 
 
-def _declared_environment(root: Path) -> set[str]:
+def _text_files(root: Path, files: Iterable[Path] | None = None) -> list[Path]:
+    return [path for path in _candidates(root, files) if path.suffix in PYTHON_SUFFIXES]
+
+
+def _declared_environment(root: Path, files: Iterable[Path] | None = None) -> set[str]:
     names: set[str] = set()
-    for pattern in ("*.yaml", "*.yml", "*.json", ".env.example"):
-        for path in root.rglob(pattern):
-            if not path.is_file() or path.is_symlink():
-                continue
-            try:
-                names.update(
-                    DECLARED_ENV_PATTERN.findall(path.read_text(encoding="utf-8", errors="replace"))
-                )
-            except OSError:
-                continue
+    for path in _candidates(root, files):
+        if path.suffix not in DECLARATION_SUFFIXES and path.name != ".env.example":
+            continue
+        try:
+            names.update(
+                DECLARED_ENV_PATTERN.findall(path.read_text(encoding="utf-8", errors="replace"))
+            )
+        except OSError:
+            continue
     return names
 
 
-def missing_environment(root: Path, content_hash: str) -> DetectorResult:
-    declared = _declared_environment(root)
+def missing_environment(
+    root: Path, content_hash: str, files: Iterable[Path] | None = None
+) -> DetectorResult:
+    files = None if files is None else tuple(files)
+    declared = _declared_environment(root, files)
     findings = []
-    for path in _text_files(root):
+    for path in _text_files(root, files):
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         for number, line in enumerate(lines, start=1):
             for name in ENV_PATTERN.findall(line):
@@ -70,9 +76,11 @@ def missing_environment(root: Path, content_hash: str) -> DetectorResult:
     return DetectorResult("missing-environment", tuple(findings))
 
 
-def route_safety(root: Path, content_hash: str) -> DetectorResult:
+def route_safety(
+    root: Path, content_hash: str, files: Iterable[Path] | None = None
+) -> DetectorResult:
     findings = []
-    for path in _text_files(root):
+    for path in _text_files(root, files):
         lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
         for index, line in enumerate(lines):
             if not ROUTE_PATTERN.match(line):

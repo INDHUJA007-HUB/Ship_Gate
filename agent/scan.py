@@ -21,7 +21,8 @@ class ScanService:
         self.cache = cache
         self.external_detectors = external_detectors
 
-    def scan(self, source: Path) -> ScanReport:
+    def scan(self, source: Path, label: str | None = None) -> ScanReport:
+        """Scan a directory. `label` names the original input (URL or archive) in the report."""
         try:
             preflight = inspect_tree(source, self.settings.limits)
         except (OSError, PreflightError) as error:
@@ -31,16 +32,17 @@ class ScanService:
             cached = self.cache.get(preflight.content_hash)
             if cached:
                 return cached
+        content_hash, files = preflight.content_hash, preflight.files
         tasks = [
-            lambda: missing_environment(root, preflight.content_hash),
-            lambda: route_safety(root, preflight.content_hash),
+            lambda: missing_environment(root, content_hash, files),
+            lambda: route_safety(root, content_hash, files),
         ]
         if self.external_detectors:
             tasks.extend(
                 [
-                    lambda: gitleaks(root, preflight.content_hash, self.settings),
-                    lambda: semgrep(root, preflight.content_hash, self.settings),
-                    lambda: checkov(root, preflight.content_hash, self.settings),
+                    lambda: gitleaks(root, content_hash, self.settings),
+                    lambda: semgrep(root, content_hash, self.settings),
+                    lambda: checkov(root, content_hash, self.settings, files=files),
                 ]
             )
 
@@ -64,7 +66,7 @@ class ScanService:
             )
         )
         errors = tuple(f"{result.detector}: {result.error}" for result in results if result.error)
-        report = ScanReport(SCHEMA_VERSION, str(root), preflight.content_hash, findings, errors)
+        report = ScanReport(SCHEMA_VERSION, label or str(root), content_hash, findings, errors)
         if self.cache:
             self.cache.put(report)
         return report

@@ -21,10 +21,13 @@ def normalized_finding(
     metadata: dict[str, Any] | None = None,
 ) -> Finding:
     candidate = Path(path)
+    if not candidate.is_absolute():
+        # Relative detector paths are relative to the scan root, never the process directory.
+        candidate = root / candidate
     try:
         relative = candidate.resolve().relative_to(root.resolve()).as_posix()
-    except ValueError:
-        relative = candidate.as_posix()
+    except (ValueError, OSError):
+        relative = Path(path).as_posix()
     stable = "|".join((finding_type, relative, str(line), detector, rule_id, content_hash))
     finding_id = hashlib.sha256(stable.encode("utf-8")).hexdigest()[:20]
     return Finding(

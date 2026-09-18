@@ -9,5 +9,8 @@ rules:
     languages: [python]
     severity: WARNING
     message: Review subprocess invocation for untrusted input.
-    pattern: subprocess.$FUNC(...)
+    patterns:
+      - pattern: subprocess.$FUNC(...)
+      # shell=True is reported once, by first-commit.unsafe-shell.
+      - pattern-not: subprocess.$FUNC(..., shell=True, ...)
 
