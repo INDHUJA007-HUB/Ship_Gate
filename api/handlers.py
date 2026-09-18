@@ -306,30 +306,35 @@ def deploy_worker_handler(event, context):
         req_data = event.get("request", {})
         request = DeploymentRequestV1(**req_data) if req_data else None
 
+        tenant_id = event.get("tenant_id", request.tenant_id if request else "unknown_tenant")
+        deployment_id = event.get("execution_id", request.candidate_id if request else "unknown_deployment")
+
         if action == "validate":
+            # State transitions are handled in create_change_set or here if needed, but ASL starts with validate
             deploy.validate_request(request)
             return {"status": "validated"}
         elif action == "create_change_set":
             template_body = event.get("template_body", "{}")
-            arn = deploy.create_change_set(request, template_body)
+            arn = deploy.create_change_set(request, template_body, deployment_id)
             return {"change_set_arn": arn}
         elif action == "describe_change_set":
             arn = event.get("change_set_arn")
-            res = deploy.describe_change_set(arn)
+            res = deploy.describe_change_set(arn, tenant_id, deployment_id)
             return {"Status": res.get("Status"), "StatusReason": res.get("StatusReason")}
         elif action == "execute_change_set":
             arn = event.get("change_set_arn")
-            deploy.execute_change_set(request, arn)
+            deploy.execute_change_set(request, arn, deployment_id)
             return {"status": "executing"}
         elif action == "poll_execution":
             stack_name = event.get("stack_name")
-            status = deploy.poll_execution(stack_name)
+            status = deploy.poll_execution(stack_name, tenant_id, deployment_id)
             return {"status": status}
         elif action == "smoke_test":
             endpoint = event.get("endpoint")
-            deploy.run_smoke_test(endpoint)
+            deploy.run_smoke_test(endpoint, tenant_id, deployment_id)
             return {"status": "smoke_test_passed"}
         elif action == "request_approval":
+            deploy.store.set_deployment_status(tenant_id, deployment_id, "awaiting_approval", int(time.time()))
             return {"status": "waiting_for_approval", "task_token": event.get("task_token")}
         else:
             return {"status": "unknown_action"}

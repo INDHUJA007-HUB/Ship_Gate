@@ -43,6 +43,7 @@ class ScanStore(Protocol):
     def get_findings(self, tenant_id: str, scan_id: str) -> list[dict]: ...
     def create_deployment(self, attempt: DeploymentAttempt) -> bool: ...
     def get_deployment(self, tenant_id: str, deployment_id: str) -> DeploymentAttempt | None: ...
+    def set_deployment_status(self, tenant_id: str, deployment_id: str, status: DeploymentStatus, updated_at: int, **kwargs) -> bool: ...
     def get_policy_decision(self, tenant_id: str, user_id: str, key: str) -> dict | None: ...
     def put_policy_decision(self, tenant_id: str, user_id: str, key: str, result: dict) -> bool: ...
 
@@ -177,6 +178,24 @@ class LocalScanStore:
                 (tenant_id, deployment_id),
             ).fetchone()
         return self._deployment(json.loads(row[0])) if row else None
+
+    def set_deployment_status(self, tenant_id, deployment_id, status, updated_at, **kwargs):
+        with self._connection() as db:
+            row = db.execute(
+                "SELECT body FROM deployments WHERE tenant=? AND deployment_id=?",
+                (tenant_id, deployment_id),
+            ).fetchone()
+            if not row:
+                return False
+            data = json.loads(row[0])
+            data["status"] = str(status)
+            data["updated_at"] = updated_at
+            data.update(kwargs)
+            db.execute(
+                "UPDATE deployments SET body=? WHERE tenant=? AND deployment_id=?",
+                (json.dumps(data, sort_keys=True), tenant_id, deployment_id),
+            )
+            return True
 
     def get_policy_decision(self, tenant_id, user_id, key):
         with self._connection() as db:
@@ -319,6 +338,30 @@ class DynamoScanStore:
             if item
             else None
         )
+
+    def set_deployment_status(self, tenant_id, deployment_id, status, updated_at, **kwargs):
+        updates = ["#s = :s", "#u = :u"]
+        expr_names = {"#s": "status", "#u": "updated_at"}
+        expr_values = {":s": str(status), ":u": updated_at}
+        
+        for k, v in kwargs.items():
+            if v is not None:
+                updates.append(f"#{k} = :{k}")
+                expr_names[f"#{k}"] = k
+                expr_values[f":{k}"] = v
+
+        try:
+            self.client.update_item(
+                TableName=self.table_name,
+                Key={"PK": self._pk(tenant_id), "SK": f"DEPLOYMENT#{deployment_id}"},
+                UpdateExpression="SET " + ", ".join(updates),
+                ExpressionAttributeNames=expr_names,
+                ExpressionAttributeValues=expr_values,
+                ConditionExpression="attribute_exists(PK)"
+            )
+            return True
+        except self.client.meta.client.exceptions.ConditionalCheckFailedException:
+            return False
 
     def get_policy_decision(self, tenant_id, user_id, key):
         result = self.client.get_item(
