@@ -134,6 +134,11 @@ def test_smoke_test_fail(deploy_service):
         deploy_service.run_smoke_test("fail", "tenant-123", "dep-123", "TargetAppStack")
     assert exc.value.code == "smoke_test_failed"
 
+def test_smoke_test_missing_but_required(deploy_service):
+    with pytest.raises(DeploymentError) as exc:
+        deploy_service.run_smoke_test(None, "tenant-123", "dep-123", "TargetAppStack", requires_smoke_test=True)
+    assert exc.value.code == "missing_smoke_test_endpoint"
+
 def test_smoke_test_timeout(deploy_service):
     with pytest.raises(DeploymentError) as exc:
         deploy_service.run_smoke_test("timeout", "tenant-123", "dep-123", "TargetAppStack")

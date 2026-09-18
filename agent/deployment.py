@@ -201,10 +201,13 @@ class DeployService:
             pass
         return None
 
-    def run_smoke_test(self, endpoint: str | None, tenant_id: str, deployment_id: str, stack_name: str) -> bool:
+    def run_smoke_test(self, endpoint: str | None, tenant_id: str, deployment_id: str, stack_name: str, requires_smoke_test: bool = False) -> bool:
         from agent.domain import DeploymentStatus
         try:
             if not endpoint:
+                if requires_smoke_test:
+                    self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status="missing_smoke_test_endpoint")
+                    raise DeploymentError("missing_smoke_test_endpoint", "Smoke test is required but no endpoint was provided.")
                 return True
                 
             if endpoint == "fail":

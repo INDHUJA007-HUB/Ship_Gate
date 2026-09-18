@@ -333,7 +333,8 @@ def deploy_worker_handler(event, context):
         elif action == "smoke_test":
             endpoint = event.get("endpoint")
             stack_name = request.target_stack if request else event.get("stack_name", "unknown_stack")
-            deploy.run_smoke_test(endpoint, tenant_id, deployment_id, stack_name)
+            requires_smoke_test = event.get("requires_smoke_test", request.requires_smoke_test if request else False)
+            deploy.run_smoke_test(endpoint, tenant_id, deployment_id, stack_name, requires_smoke_test)
             return {"status": "smoke_test_passed"}
         elif action == "request_approval":
             deploy.store.set_deployment_status(tenant_id, deployment_id, "awaiting_approval", int(time.time()))
