@@ -1,0 +1,13 @@
+rules:
+  - id: first-commit.unsafe-shell
+    languages: [python]
+    severity: ERROR
+    message: Avoid shell=True when processing untrusted input.
+    patterns:
+      - pattern: subprocess.$FUNC(..., shell=True, ...)
+  - id: first-commit.unsafe-subprocess
+    languages: [python]
+    severity: WARNING
+    message: Review subprocess invocation for untrusted input.
+    pattern: subprocess.$FUNC(...)
+

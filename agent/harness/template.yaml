@@ -1,0 +1,16 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Trusted local smoke harness only; no user source is executed.
+Resources:
+  SmokeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      Runtime: python3.12
+      Architectures: [x86_64]
+      Handler: app.handler
+      CodeUri: .
+      Timeout: 10
+      MemorySize: 128
+      Environment:
+        Variables:
+          FIRST_COMMIT_MODE: local
