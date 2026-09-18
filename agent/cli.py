@@ -104,6 +104,46 @@ def build_parser() -> argparse.ArgumentParser:
             "--cache-db", type=Path, default=Path(".first-commit-cache/explanations.sqlite3")
         )
         reasoning.add_argument("--refresh", action="store_true", help="ignore cached results")
+    remediate = commands.add_parser(
+        "remediate-iam",
+        help="propose a strictly narrower policy from activity or a labelled estimate (Phase 7)",
+    )
+    remediate.add_argument("source", type=Path)
+    remediate.add_argument("target", help="relative path to a JSON or SAM YAML identity policy")
+    remediate.add_argument("--tenant", required=True)
+    remediate.add_argument(
+        "--environment", required=True, choices=["development", "staging", "production"]
+    )
+    remediate.add_argument(
+        "--role", help="IAM role ARN whose activity should be analyzed (activity method only)"
+    )
+    remediate.add_argument(
+        "--method",
+        choices=["auto", "activity", "static"],
+        default="auto",
+        help="auto prefers real activity and states when it falls back to an estimate",
+    )
+    remediate.add_argument("--trail-arn", help="CloudTrail trail ARN to analyze")
+    remediate.add_argument(
+        "--access-role", help="service role IAM Access Analyzer assumes to read the trail"
+    )
+    remediate.add_argument("--start-time", help="ISO-8601 start of the activity window")
+    remediate.add_argument("--end-time", help="ISO-8601 end of the activity window")
+    remediate.add_argument("--regions", help="comma-separated regions covered by the trail")
+    remediate.add_argument("--all-regions", action="store_true")
+    remediate.add_argument("--region", help="AWS region for the Access Analyzer client")
+    remediate.add_argument(
+        "--verify",
+        choices=["local", "aws"],
+        default="local",
+        help="local subset proof, plus CheckNoNewAccess when aws is reachable",
+    )
+    remediate.add_argument("--timeout", type=float, default=600, help="generation timeout, seconds")
+    remediate.add_argument("--interval", type=float, default=5, help="poll interval, seconds")
+    remediate.add_argument(
+        "--json", action="store_true", help="print the full recommendation instead of the report"
+    )
+    remediate.add_argument("--output", type=Path, help="also write the recommendation JSON here")
     _pipeline_parsers(commands)
     return parser
 
@@ -180,6 +220,8 @@ def main() -> int:
         return _policy_command(arguments)
     if arguments.command in {"explain", "ask"}:
         return _reasoning_command(arguments)
+    if arguments.command == "remediate-iam":
+        return _least_privilege_command(arguments)
     if arguments.command != "scan":
         return _remediation_command(arguments)
     cache = None if arguments.no_cache else ScanCache(arguments.cache_dir)
@@ -315,6 +357,61 @@ def _pipeline_command(args):
         output = {**output, "trace": pipeline.last_execution.history}
     print(json.dumps(output, indent=2, sort_keys=True))
     return EXIT_CODES.get(run["status"], 2)
+
+
+def _least_privilege_command(args):
+    from agent.least_privilege import recommend, render
+
+    generator = None
+    if (args.role and args.method != "static") or args.verify == "aws":
+        try:
+            from agent.access_analyzer import build_analyzer
+
+            generator = build_analyzer(args.region)
+        except Exception:  # noqa: BLE001 - reported as a missing-analyzer reason code
+            generator = None
+    if args.verify == "aws" and generator is None:
+        print(json.dumps({"status": "failed", "error": "aws_verification_requires_credentials"}))
+        return 2
+    try:
+        cloud_trail = None
+        if args.trail_arn:
+            from agent.access_analyzer import cloud_trail_from_config
+
+            cloud_trail = cloud_trail_from_config(
+                trail_arn=args.trail_arn,
+                access_role=args.access_role,
+                start_time=args.start_time,
+                end_time=args.end_time,
+                regions=[item for item in (args.regions or "").split(",") if item],
+                all_regions=args.all_regions,
+            )
+        elif args.access_role or args.start_time or args.end_time:
+            raise ValueError("incomplete_cloud_trail_details")
+        recommendation = recommend(
+            args.source,
+            args.target,
+            tenant=args.tenant,
+            environment=args.environment,
+            role_arn=args.role,
+            method=args.method,
+            generator=generator,
+            cloud_trail=cloud_trail,
+            verify=args.verify,
+            timeout_seconds=args.timeout,
+            interval_seconds=args.interval,
+        )
+    except (ValueError, OSError, TypeError, KeyError):
+        print(
+            json.dumps({"status": "failed", "error": "Invalid, unsupported, or inaccessible input"})
+        )
+        return 2
+    payload = recommendation.to_dict()
+    if args.output:
+        with args.output.open("x", encoding="utf-8") as handle:
+            json.dump(payload, handle, indent=2, sort_keys=True)
+    print(json.dumps(payload, indent=2, sort_keys=True) if args.json else render(recommendation))
+    return 0 if recommendation.chosen else 2
 
 
 def _policy_command(args):
