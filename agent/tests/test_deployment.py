@@ -113,7 +113,7 @@ def test_describe_change_set_empty(deploy_service, mock_cfn):
         "StatusReason": "The submitted information didn't contain changes"
     }
     with pytest.raises(DeploymentError) as exc:
-        deploy_service.describe_change_set("arn", "tenant-123", "dep-123")
+        deploy_service.describe_change_set("arn", "tenant-123", "dep-123", "TargetAppStack")
     assert exc.value.code == "change_set_empty"
 
 def test_poll_execution_success(deploy_service, mock_cfn):
@@ -132,12 +132,12 @@ def test_poll_execution_rollback(deploy_service, mock_cfn):
 
 def test_smoke_test_fail(deploy_service):
     with pytest.raises(DeploymentError) as exc:
-        deploy_service.run_smoke_test("fail", "tenant-123", "dep-123")
+        deploy_service.run_smoke_test("fail", "tenant-123", "dep-123", "TargetAppStack")
     assert exc.value.code == "smoke_test_failed"
 
 def test_smoke_test_timeout(deploy_service):
     with pytest.raises(DeploymentError) as exc:
-        deploy_service.run_smoke_test("timeout", "tenant-123", "dep-123")
+        deploy_service.run_smoke_test("timeout", "tenant-123", "dep-123", "TargetAppStack")
     assert exc.value.code == "smoke_test_timed_out"
 
 def test_full_run_transitions_and_audit_order(deploy_service, mock_store, mock_cfn, valid_request):
@@ -148,7 +148,7 @@ def test_full_run_transitions_and_audit_order(deploy_service, mock_store, mock_c
     mock_store.create_deployment.assert_called_once()
     mock_cfn.create_change_set.assert_called_once()
     
-    deploy_service.describe_change_set("arn", "tenant-123", "dep-123") # if it's not complete, this might just pass
+    deploy_service.describe_change_set("arn", "tenant-123", "dep-123", "TargetAppStack") # if it's not complete, this might just pass
     
     deploy_service.execute_change_set(valid_request, "arn", "dep-123")
     
@@ -179,3 +179,32 @@ def test_failed_run_records_terminal_state(deploy_service, mock_store, mock_cfn,
     
     args, kwargs = failed_calls[-1]
     assert kwargs.get("rollback_status") == "AWS error"
+
+def test_concurrent_deployment_prevented(deploy_service, mock_store, mock_cfn, valid_request):
+    mock_store.acquire_lock.return_value = False
+    with pytest.raises(DeploymentError) as exc:
+        deploy_service.create_change_set(valid_request, "{}", "dep-123")
+    assert exc.value.code == "deployment_in_progress"
+    mock_cfn.create_change_set.assert_not_called()
+
+def test_lock_released_on_create_exception(deploy_service, mock_store, mock_cfn, valid_request):
+    mock_store.acquire_lock.return_value = True
+    mock_cfn.create_change_set.side_effect = Exception("AWS error")
+    with pytest.raises(Exception):
+        deploy_service.create_change_set(valid_request, "{}", "dep-123")
+    mock_store.release_lock.assert_called_with("tenant-123", "TargetAppStack")
+
+def test_lock_released_on_smoke_test_success(deploy_service, mock_store):
+    deploy_service.run_smoke_test(None, "tenant-123", "dep-123", "TargetAppStack")
+    mock_store.release_lock.assert_called_with("tenant-123", "TargetAppStack")
+
+def test_lock_released_on_smoke_test_failure(deploy_service, mock_store):
+    with pytest.raises(DeploymentError):
+        deploy_service.run_smoke_test("fail", "tenant-123", "dep-123", "TargetAppStack")
+    mock_store.release_lock.assert_called_with("tenant-123", "TargetAppStack")
+
+def test_lock_released_on_poll_exception(deploy_service, mock_store, mock_cfn):
+    mock_cfn.describe_stacks.side_effect = Exception("Unexpected error")
+    with pytest.raises(Exception):
+        deploy_service.poll_execution("TargetAppStack", "tenant-123", "dep-123")
+    mock_store.release_lock.assert_called_with("tenant-123", "TargetAppStack")

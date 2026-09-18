@@ -64,6 +64,9 @@ class DeployService:
             raise DeploymentError("digest_mismatch", "Validation digest does not match stored result.")
 
     def create_change_set(self, request: DeploymentRequestV1, template_body: str, deployment_id: str) -> str:
+        if not self.store.acquire_lock(request.tenant_id, request.target_stack):
+            raise DeploymentError("deployment_in_progress", "A deployment is already in progress for this stack.")
+            
         from agent.domain import DeploymentAttempt, DeploymentStatus
         
         attempt = DeploymentAttempt(
@@ -84,6 +87,7 @@ class DeployService:
             self.validate_request(request)
         except Exception as e:
             self.store.set_deployment_status(request.tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status=str(e))
+            self.store.release_lock(request.tenant_id, request.target_stack)
             raise
 
         change_set_name = f"deploy-{request.candidate_id}-{int(time.time())}"
@@ -98,6 +102,7 @@ class DeployService:
             return res['Id']
         except Exception as e:
             self.store.set_deployment_status(request.tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status=str(e))
+            self.store.release_lock(request.tenant_id, request.target_stack)
             if "does not exist" in str(e):
                 res = self.client.create_change_set(
                     StackName=request.target_stack,
@@ -109,18 +114,23 @@ class DeployService:
                 return res['Id']
             raise DeploymentError("cfn_error", str(e))
 
-    def describe_change_set(self, change_set_arn: str, tenant_id: str, deployment_id: str) -> dict:
+    def describe_change_set(self, change_set_arn: str, tenant_id: str, deployment_id: str, stack_name: str) -> dict:
         from agent.domain import DeploymentStatus
-        res = self.client.describe_change_set(ChangeSetName=change_set_arn)
-        if res.get('Status') == 'CREATE_COMPLETE':
-            self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.CHANGE_SET_READY, int(time.time()))
-        elif res.get('Status') == 'FAILED' and "didn't contain changes" in res.get('StatusReason', ''):
-            self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.CANCELLED, int(time.time()), rollback_status="change_set_empty")
-        status = res.get('Status')
-        if status in ['FAILED']:
-            if "The submitted information didn't contain changes" in res.get('StatusReason', ''):
-                raise DeploymentError("change_set_empty", "The change set contains no changes.")
-        return res
+        try:
+            res = self.client.describe_change_set(ChangeSetName=change_set_arn)
+            if res.get('Status') == 'CREATE_COMPLETE':
+                self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.CHANGE_SET_READY, int(time.time()))
+            elif res.get('Status') == 'FAILED' and "didn't contain changes" in res.get('StatusReason', ''):
+                self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.CANCELLED, int(time.time()), rollback_status="change_set_empty")
+                self.store.release_lock(tenant_id, stack_name)
+            status = res.get('Status')
+            if status in ['FAILED']:
+                if "The submitted information didn't contain changes" in res.get('StatusReason', ''):
+                    raise DeploymentError("change_set_empty", "The change set contains no changes.")
+            return res
+        except Exception:
+            self.store.release_lock(tenant_id, stack_name)
+            raise
 
     def execute_change_set(self, request: DeploymentRequestV1, change_set_arn: str, deployment_id: str):
         from agent.domain import DeploymentStatus
@@ -132,42 +142,51 @@ class DeployService:
             self.client.execute_change_set(ChangeSetName=change_set_arn)
         except Exception as e:
             self.store.set_deployment_status(request.tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status=str(e))
+            self.store.release_lock(request.tenant_id, request.target_stack)
             raise
 
     def poll_execution(self, stack_name: str, tenant_id: str, deployment_id: str) -> str:
         from agent.domain import DeploymentStatus
-        for _ in range(60):
-            res = self.client.describe_stacks(StackName=stack_name)
-            status = res['Stacks'][0]['StackStatus']
-            
-            if status.endswith('_COMPLETE') and 'ROLLBACK' not in status:
-                self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.SUCCEEDED, int(time.time()))
-                return "succeeded"
-            if 'ROLLBACK' in status and status.endswith('_COMPLETE'):
-                reason = res['Stacks'][0].get('StackStatusReason', 'Rolled back')
-                self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.ROLLED_BACK, int(time.time()), rollback_status=reason)
-                raise DeploymentError("rolled_back", f"Deployment rolled back: {reason}")
-            if status.endswith('_FAILED'):
-                reason = res['Stacks'][0].get('StackStatusReason', 'Failed')
-                self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status=reason)
-                raise DeploymentError("failed", f"Deployment failed: {reason}")
+        try:
+            for _ in range(60):
+                res = self.client.describe_stacks(StackName=stack_name)
+                status = res['Stacks'][0]['StackStatus']
                 
-            time.sleep(5)
-            
-        self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status="rollback_timed_out")
-        raise DeploymentError("rollback_timed_out", "Deployment timed out.")
+                if status.endswith('_COMPLETE') and 'ROLLBACK' not in status:
+                    self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.SUCCEEDED, int(time.time()))
+                    # We do not release lock yet if smoke test is next. (Or wait, smoke test releases it!)
+                    return "succeeded"
+                if 'ROLLBACK' in status and status.endswith('_COMPLETE'):
+                    reason = res['Stacks'][0].get('StackStatusReason', 'Rolled back')
+                    self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.ROLLED_BACK, int(time.time()), rollback_status=reason)
+                    raise DeploymentError("rolled_back", f"Deployment rolled back: {reason}")
+                if status.endswith('_FAILED'):
+                    reason = res['Stacks'][0].get('StackStatusReason', 'Failed')
+                    self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status=reason)
+                    raise DeploymentError("failed", f"Deployment failed: {reason}")
+                    
+                time.sleep(5)
+                
+            self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status="rollback_timed_out")
+            raise DeploymentError("rollback_timed_out", "Deployment timed out.")
+        except Exception:
+            self.store.release_lock(tenant_id, stack_name)
+            raise
 
-    def run_smoke_test(self, endpoint: str | None, tenant_id: str, deployment_id: str) -> bool:
+    def run_smoke_test(self, endpoint: str | None, tenant_id: str, deployment_id: str, stack_name: str) -> bool:
         from agent.domain import DeploymentStatus
-        if not endpoint:
+        try:
+            if not endpoint:
+                return True
+                
+            if endpoint == "fail":
+                self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status="smoke_test_failed")
+                raise DeploymentError("smoke_test_failed", "Smoke test returned an error.")
+            if endpoint == "timeout":
+                self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status="smoke_test_timed_out")
+                raise DeploymentError("smoke_test_timed_out", "Smoke test timed out.")
+                
             return True
-            
-        if endpoint == "fail":
-            self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status="smoke_test_failed")
-            raise DeploymentError("smoke_test_failed", "Smoke test returned an error.")
-        if endpoint == "timeout":
-            self.store.set_deployment_status(tenant_id, deployment_id, DeploymentStatus.FAILED, int(time.time()), rollback_status="smoke_test_timed_out")
-            raise DeploymentError("smoke_test_timed_out", "Smoke test timed out.")
-            
-        return True
+        finally:
+            self.store.release_lock(tenant_id, stack_name)
         # Actual implementation would make an HTTP call or Lambda invoke

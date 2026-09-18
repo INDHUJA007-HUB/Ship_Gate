@@ -44,6 +44,8 @@ class ScanStore(Protocol):
     def create_deployment(self, attempt: DeploymentAttempt) -> bool: ...
     def get_deployment(self, tenant_id: str, deployment_id: str) -> DeploymentAttempt | None: ...
     def set_deployment_status(self, tenant_id: str, deployment_id: str, status: DeploymentStatus, updated_at: int, **kwargs) -> bool: ...
+    def acquire_lock(self, tenant_id: str, stack_name: str) -> bool: ...
+    def release_lock(self, tenant_id: str, stack_name: str) -> bool: ...
     def get_policy_decision(self, tenant_id: str, user_id: str, key: str) -> dict | None: ...
     def put_policy_decision(self, tenant_id: str, user_id: str, key: str, result: dict) -> bool: ...
 
@@ -63,6 +65,8 @@ class LocalScanStore:
                 "CREATE TABLE IF NOT EXISTS deployments ("
                 "tenant TEXT, deployment_id TEXT, body TEXT, "
                 "PRIMARY KEY (tenant, deployment_id));"
+                "CREATE TABLE IF NOT EXISTS deployment_locks ("
+                "tenant TEXT, stack_name TEXT, PRIMARY KEY (tenant, stack_name));"
                 "CREATE TABLE IF NOT EXISTS policy_decisions ("
                 "tenant TEXT, user_id TEXT, cache_key TEXT, body TEXT, "
                 "PRIMARY KEY (tenant, user_id, cache_key));"
@@ -195,6 +199,19 @@ class LocalScanStore:
                 "UPDATE deployments SET body=? WHERE tenant=? AND deployment_id=?",
                 (json.dumps(data, sort_keys=True), tenant_id, deployment_id),
             )
+            return True
+
+    def acquire_lock(self, tenant_id, stack_name):
+        with self._connection() as db:
+            try:
+                db.execute("INSERT INTO deployment_locks VALUES (?,?)", (tenant_id, stack_name))
+                return True
+            except sqlite3.IntegrityError:
+                return False
+
+    def release_lock(self, tenant_id, stack_name):
+        with self._connection() as db:
+            db.execute("DELETE FROM deployment_locks WHERE tenant=? AND stack_name=?", (tenant_id, stack_name))
             return True
 
     def get_policy_decision(self, tenant_id, user_id, key):
@@ -362,6 +379,24 @@ class DynamoScanStore:
             return True
         except self.client.meta.client.exceptions.ConditionalCheckFailedException:
             return False
+
+    def acquire_lock(self, tenant_id, stack_name):
+        try:
+            self.client.put_item(
+                TableName=self.table.name if hasattr(self.table, 'name') else 'table',
+                Item={"PK": self._pk(tenant_id), "SK": f"LOCK#{stack_name}", "entity": "DeploymentLock"},
+                ConditionExpression="attribute_not_exists(PK)"
+            )
+            return True
+        except self.client.meta.client.exceptions.ConditionalCheckFailedException:
+            return False
+
+    def release_lock(self, tenant_id, stack_name):
+        self.client.delete_item(
+            TableName=self.table.name if hasattr(self.table, 'name') else 'table',
+            Key={"PK": self._pk(tenant_id), "SK": f"LOCK#{stack_name}"}
+        )
+        return True
 
     def get_policy_decision(self, tenant_id, user_id, key):
         result = self.client.get_item(
