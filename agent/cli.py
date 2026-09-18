@@ -5,12 +5,11 @@ import json
 import time
 from pathlib import Path
 
-from agent.cache import ScanCache, _finding
+from agent.cache import ScanCache, report_from_dict
 from agent.config import Settings
 from agent.finding_policy import FindingPolicy, PolicyContext
 from agent.governance import Approval, Governance
 from agent.ingest import ingest
-from agent.models import SCHEMA_VERSION, ScanReport
 from agent.preflight import PreflightError
 from agent.remediation import Proposal, propose_iam, validate_proposal
 from agent.runtime_validation import validate_runtime
@@ -71,13 +70,116 @@ def build_parser() -> argparse.ArgumentParser:
     policy.add_argument("--environment", action="append", default=[])
     policy.add_argument("--current-hash", required=True)
     policy.add_argument("--cache-db", type=Path, default=Path(".first-commit-cache/policy.sqlite3"))
+    for name, description in (
+        ("explain", "explain policy-evaluated findings in plain language (Phase 5)"),
+        ("ask", "answer a question about a policy-evaluated scan (Phase 5)"),
+    ):
+        reasoning = commands.add_parser(name, help=description)
+        reasoning.add_argument("report", type=Path, help="JSON from first-commit scan")
+        reasoning.add_argument("policy_result", type=Path, help="JSON from first-commit policy")
+        if name == "ask":
+            reasoning.add_argument("question")
+        reasoning.add_argument("--tenant", required=True)
+        reasoning.add_argument("--user", required=True)
+        reasoning.add_argument("--audience", choices=["beginner", "developer"], default="beginner")
+        reasoning.add_argument(
+            "--provider",
+            choices=["none", "anthropic", "bedrock", "ollama"],
+            help="model provider (default: FIRST_COMMIT_MODEL_PROVIDER, else none)",
+        )
+        reasoning.add_argument("--region", help="AWS region for the bedrock provider")
+        reasoning.add_argument("--small-model", help="explicit low-level model name")
+        reasoning.add_argument("--large-model", help="explicit high-level model name")
+        reasoning.add_argument(
+            "--ollama-profile",
+            choices=["qwen3", "deepseek-r1", "mistral", "olmo2", "gpt-oss", "kimi"],
+            help="reviewed local small/large model pair",
+        )
+        reasoning.add_argument("--ollama-url", help="loopback Ollama URL")
+        reasoning.add_argument("--ollama-max-context", type=int, help="local context safety cap")
+        reasoning.add_argument("--ollama-timeout", type=float, help="local inference timeout")
+        reasoning.add_argument("--max-calls", type=int, default=12)
+        reasoning.add_argument("--max-cost", type=float, default=1.0, help="USD, list price")
+        reasoning.add_argument(
+            "--cache-db", type=Path, default=Path(".first-commit-cache/explanations.sqlite3")
+        )
+        reasoning.add_argument("--refresh", action="store_true", help="ignore cached results")
+    _pipeline_parsers(commands)
     return parser
+
+
+def _pipeline_parsers(commands) -> None:
+    def principal(command, user=True):
+        command.add_argument("--tenant", required=True)
+        if user:
+            command.add_argument("--user", required=True)
+        command.add_argument(
+            "--state-dir", type=Path, default=Path(".first-commit-cache"), help="local state root"
+        )
+
+    def faults(command):
+        command.add_argument(
+            "--fault",
+            action="append",
+            default=[],
+            metavar="STEP=KIND[:N]",
+            help="operator-only chaos testing, e.g. semgrep=timeout or gitleaks=transient:2",
+        )
+
+    run = commands.add_parser("run", help="run the durable scan pipeline (Phase 6)")
+    run.add_argument("source", help="directory, .zip archive, or https Git URL")
+    principal(run)
+    run.add_argument(
+        "--environment",
+        action="append",
+        default=[],
+        choices=["development", "staging", "production"],
+    )
+    run.add_argument("--audience", choices=["beginner", "developer"], default="beginner")
+    run.add_argument("--provider", choices=["none", "anthropic", "bedrock", "ollama"])
+    run.add_argument("--region")
+    run.add_argument("--idempotency-key", help="the same key always names the same run")
+    run.add_argument("--refresh", action="store_true", help="do not reuse an identical result")
+    run.add_argument("--no-external", action="store_true", help="first-party detectors only")
+    run.add_argument("--trace", action="store_true", help="include the state transition history")
+    faults(run)
+    resume = commands.add_parser("resume", help="rerun only the incomplete checks of a run")
+    resume.add_argument("run_id")
+    principal(resume)
+    resume.add_argument("--provider", choices=["none", "anthropic", "bedrock", "ollama"])
+    resume.add_argument("--no-external", action="store_true")
+    resume.add_argument("--trace", action="store_true")
+    faults(resume)
+    status = commands.add_parser("runs", help="show a run's status, or its full result")
+    status.add_argument("run_id")
+    principal(status, user=False)
+    status.add_argument("--result", action="store_true")
+    reviews = commands.add_parser("reviews", help="list review items (the dead-letter path)")
+    principal(reviews, user=False)
+    reviews.add_argument("--run")
+    orchestrate = commands.add_parser(
+        "orchestrate", help="send a request to the orchestrating agent"
+    )
+    orchestrate.add_argument("request")
+    principal(orchestrate)
+    orchestrate.add_argument(
+        "--model",
+        choices=["none", "anthropic", "bedrock"],
+        default="none",
+        help="model for requests the deterministic planner cannot map (default: none)",
+    )
+    orchestrate.add_argument("--region")
+    orchestrate.add_argument("--no-external", action="store_true")
 
 
 def main() -> int:
     arguments = build_parser().parse_args()
+    if arguments.command in {"run", "resume", "runs", "reviews", "orchestrate"}:
+        return _pipeline_command(arguments)
     if arguments.command == "policy":
         return _policy_command(arguments)
+    if arguments.command in {"explain", "ask"}:
+        return _reasoning_command(arguments)
     if arguments.command != "scan":
         return _remediation_command(arguments)
     cache = None if arguments.no_cache else ScanCache(arguments.cache_dir)
@@ -100,18 +202,124 @@ def _load(path):
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def _reasoning_command(args):
+    from agent.reasoning import ReasoningConfig, ReasoningContext, ReasoningService
+    from agent.reasoning.budget import Budget
+    from agent.reasoning.cache import SqliteExplanationCache
+    from agent.reasoning.providers import ProviderError, build_provider
+
+    try:
+        report = report_from_dict(_load(args.report))
+        policy = _load(args.policy_result)
+        service = ReasoningService(
+            build_provider(
+                args.provider,
+                region=args.region,
+                small_model=args.small_model,
+                large_model=args.large_model,
+                ollama_profile=args.ollama_profile,
+                ollama_url=args.ollama_url,
+                ollama_max_context=args.ollama_max_context,
+                ollama_timeout=args.ollama_timeout,
+            ),
+            SqliteExplanationCache(args.cache_db),
+            ReasoningConfig(budget=Budget(max_calls=args.max_calls, max_cost_usd=args.max_cost)),
+        )
+        context = ReasoningContext(args.tenant, args.user, args.audience, args.refresh)
+        if args.command == "explain":
+            result = service.explain(report, policy, context)
+            passed = result["status"] == "complete"
+        else:
+            result = service.ask(args.question, report, policy, context)
+            passed = result["status"] in {"answered", "blocked", "clarification_needed"}
+    except ProviderError as error:
+        print(json.dumps({"status": "error", "reason": f"provider_{error.kind}"}))
+        return 2
+    except (ValueError, TypeError, KeyError, OSError):
+        print(json.dumps({"status": "error", "reason": "invalid_reasoning_input"}))
+        return 2
+    print(json.dumps(result, indent=2, sort_keys=True))
+    return 0 if passed else 2
+
+
+EXIT_CODES = {"completed": 0, "failed": 2, "partial": 3}
+
+
+def _pipeline_command(args):
+    from agent.orchestration.contracts import InvalidRequest, new_run_id
+    from agent.orchestration.faults import FaultPlan
+    from agent.orchestration.pipeline import STEP_NAMES, local_pipeline
+    from agent.reasoning.providers import ProviderError, build_provider
+
+    provider = getattr(args, "provider", None)
+    region = getattr(args, "region", None)
+    try:
+        pipeline = local_pipeline(
+            args.state_dir,
+            faults=FaultPlan.parse(getattr(args, "fault", []), STEP_NAMES),
+            external_detectors=not getattr(args, "no_external", False),
+            provider_factory=lambda: build_provider(provider, region=region),
+            provider_identity=provider or "env",
+        )
+        tenant = args.tenant
+        if args.command == "reviews":
+            print(json.dumps(pipeline.reviews(tenant, args.run), indent=2, sort_keys=True))
+            return 0
+        if args.command == "runs":
+            run = pipeline.status(tenant, args.run_id)
+            shown = pipeline.result(tenant, args.run_id) if args.result else run
+            if shown is None:
+                print(json.dumps({"status": "error", "reason": "run_not_found"}))
+                return 2
+            print(json.dumps(shown, indent=2, sort_keys=True))
+            return EXIT_CODES.get(run["status"], 0)
+        if args.command == "orchestrate":
+            from agent.orchestration.agent import OrchestratorAgent
+
+            model = None
+            if args.model != "none":
+                from agent.orchestration.claude_model import ClaudeModel
+
+                model = ClaudeModel(args.model, region=region)
+            agent = OrchestratorAgent(
+                pipeline,
+                tenant=tenant,
+                user=args.user,
+                explanations=pipeline.context.explanations,
+                provider_factory=lambda: build_provider(None),
+                model=model,
+            )
+            reply = agent.handle(args.request)
+            print(json.dumps(reply, indent=2, sort_keys=True))
+            return 0 if reply["route"] not in {"rejected", "model_error"} else 2
+        if args.command == "resume":
+            run = pipeline.resume(tenant, args.run_id)
+        else:
+            run = pipeline.submit(
+                {
+                    "tenant_id": tenant,
+                    "user_id": args.user,
+                    "run_id": new_run_id(tenant, args.idempotency_key),
+                    "source_ref": args.source,
+                    "environments": args.environment,
+                    "audience": args.audience,
+                    "refresh": args.refresh,
+                }
+            )
+    except (InvalidRequest, ProviderError, ValueError) as error:
+        reason = str(error) if isinstance(error, InvalidRequest) else "invalid_pipeline_input"
+        print(json.dumps({"status": "error", "reason": reason}))
+        return 2
+    output = pipeline.result(tenant, run["run_id"]) or run
+    if getattr(args, "trace", False) and pipeline.last_execution:
+        output = {**output, "trace": pipeline.last_execution.history}
+    print(json.dumps(output, indent=2, sort_keys=True))
+    return EXIT_CODES.get(run["status"], 2)
+
+
 def _policy_command(args):
     try:
-        data = _load(args.report)
-        if data["schema_version"] != SCHEMA_VERSION:
-            raise ValueError("Unsupported finding schema")
-        report = ScanReport(
-            data["schema_version"],
-            data["source"],
-            data["content_hash"],
-            tuple(_finding(f) for f in data["findings"]),
-            tuple(data["detector_errors"]),
-        )
+        report = report_from_dict(_load(args.report))
         result = FindingPolicy(args.cache_db).evaluate(
             report,
             PolicyContext(
