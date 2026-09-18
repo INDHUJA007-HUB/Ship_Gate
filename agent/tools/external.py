@@ -15,7 +15,12 @@ from pathlib import Path
 from agent.config import RULES, Settings, semgrep_rules_path
 from agent.models import DetectorResult, FindingType, Severity
 from agent.normalize import normalized_finding
-from agent.tools.command import ToolExecutionError, ToolUnavailableError, run_tool
+from agent.tools.command import (
+    ToolExecutionError,
+    ToolTimeoutError,
+    ToolUnavailableError,
+    run_tool,
+)
 
 ToolRunner = Callable[[list[str], int, Path], object]
 SEMGREP_RULES = {
@@ -26,8 +31,21 @@ CHECKOV_SUFFIXES = {".yaml", ".yml", ".json", ".template"}
 CHECKOV_BATCH = 100  # Keeps each command line far below the Windows 32K character limit.
 
 
-def _error(detector: str, error: Exception | str) -> DetectorResult:
-    return DetectorResult(detector, (), str(error))
+def _error(detector: str, code: str) -> DetectorResult:
+    return DetectorResult(detector, (), code)
+
+
+def _failure(detector: str, error: Exception) -> DetectorResult:
+    # Exception text can quote tool output, so only the failure class is reported.
+    if isinstance(error, ToolUnavailableError):
+        return _error(detector, "tool_unavailable")
+    if isinstance(error, ToolTimeoutError):
+        return _error(detector, "timeout")
+    if isinstance(error, json.JSONDecodeError):
+        return _error(detector, "malformed_output")
+    if isinstance(error, OSError):
+        return _error(detector, "io_error")
+    return _error(detector, "tool_failed")
 
 
 def gitleaks(root: Path, content_hash: str, settings: Settings, runner=run_tool) -> DetectorResult:
@@ -54,13 +72,15 @@ def gitleaks(root: Path, content_hash: str, settings: Settings, runner=run_tool)
             "--no-banner",
         ]
         try:
-            result = runner(command, settings.limits.timeout_seconds, workspace)
+            runner(command, settings.limits.timeout_seconds, workspace)
             # Gitleaks returns 1 when leaks are found; its report is authoritative.
             if not report.exists():
-                return _error(detector, f"gitleaks did not create a JSON report: {result.stderr}")
+                return _error(detector, "missing_report")
             entries = json.loads(report.read_text(encoding="utf-8"))
         except (ToolUnavailableError, ToolExecutionError, OSError, json.JSONDecodeError) as error:
-            return _error(detector, error)
+            return _failure(detector, error)
+    if not isinstance(entries, list):
+        return _error(detector, "malformed_output")
     findings = tuple(
         normalized_finding(
             finding_type=FindingType.SECRET,
@@ -100,9 +120,11 @@ def semgrep(root: Path, content_hash: str, settings: Settings, runner=run_tool) 
             result = runner(command, settings.limits.timeout_seconds, Path(workspace))
             payload = json.loads(result.stdout)
         except (ToolUnavailableError, ToolExecutionError, json.JSONDecodeError) as error:
-            return _error(detector, error)
+            return _failure(detector, error)
     if result.returncode not in (0, 1):
-        return _error(detector, result.stderr or f"semgrep exited {result.returncode}")
+        return _error(detector, "tool_failed")
+    if not isinstance(payload, dict):
+        return _error(detector, "malformed_output")
     findings, unmapped = [], set()
     for entry in payload.get("results", []):
         check_id = entry.get("check_id", "")
@@ -127,8 +149,7 @@ def semgrep(root: Path, content_hash: str, settings: Settings, runner=run_tool) 
             )
         )
     # Never guess a category: an unknown rule makes the scan partial instead of mislabelled.
-    error = f"unmapped semgrep rules: {', '.join(sorted(unmapped))}" if unmapped else None
-    return DetectorResult(detector, tuple(findings), error)
+    return DetectorResult(detector, tuple(findings), "unmapped_rule" if unmapped else None)
 
 
 def _templates(root: Path, files: Iterable[Path] | None) -> list[Path]:
@@ -185,9 +206,9 @@ def checkov(
                 result = runner(command, settings.limits.timeout_seconds, workspace)
                 payload = json.loads(result.stdout)
             except (ToolUnavailableError, ToolExecutionError, json.JSONDecodeError) as error:
-                return _error(detector, error)
+                return _failure(detector, error)
             if result.returncode not in (0, 1):
-                return _error(detector, result.stderr or f"checkov exited {result.returncode}")
+                return _error(detector, "tool_failed")
             for report in payload if isinstance(payload, list) else [payload]:
                 results = report.get("results", {})
                 for kind in ("failed_checks", "skipped_checks"):
@@ -197,7 +218,7 @@ def checkov(
                             continue
                         path = _checkov_path(entry.get("file_path", ""), workspace, set(batch))
                         if path is None:
-                            return _error(detector, "checkov reported an unrecognized file path")
+                            return _error(detector, "unrecognized_output")
                         group = groups.setdefault(
                             (path, str(entry.get("resource") or "unknown")),
                             {"checks": set(), "suppressed": set(), "lines": []},

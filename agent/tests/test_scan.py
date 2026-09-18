@@ -26,8 +26,13 @@ def test_crashed_detector_returns_partial_without_exception_text(monkeypatch):
     def crashed(*args):
         raise RuntimeError("sensitive source must never be emitted")
 
-    monkeypatch.setattr("agent.scan.missing_environment", crashed)
+    import dataclasses
+
+    from agent.detectors import DETECTORS
+
+    broken = dataclasses.replace(DETECTORS["missing-environment"], run=crashed)
+    monkeypatch.setitem(DETECTORS, "missing-environment", broken)
     report = ScanService(Settings(), external_detectors=False).scan(GOLDEN)
     assert not report.complete
     assert len(report.findings) == 2
-    assert report.detector_errors == ("detector: detector_crashed",)
+    assert report.detector_errors == ("missing-environment: crashed",)

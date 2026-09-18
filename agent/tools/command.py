@@ -20,6 +20,10 @@ class ToolExecutionError(RuntimeError):
     pass
 
 
+class ToolTimeoutError(ToolExecutionError):
+    pass
+
+
 def run_tool(command: list[str], timeout_seconds: int, cwd: Path) -> CommandResult:
     try:
         completed = subprocess.run(
@@ -36,7 +40,7 @@ def run_tool(command: list[str], timeout_seconds: int, cwd: Path) -> CommandResu
     except FileNotFoundError as error:
         raise ToolUnavailableError(f"scanner executable not found: {command[0]}") from error
     except subprocess.TimeoutExpired as error:
-        raise ToolExecutionError(
+        raise ToolTimeoutError(
             f"scanner timed out after {timeout_seconds}s: {command[0]}"
         ) from error
     return CommandResult(completed.stdout, completed.stderr, completed.returncode)

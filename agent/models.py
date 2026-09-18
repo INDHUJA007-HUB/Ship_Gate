@@ -55,11 +55,28 @@ class Finding:
         return asdict(self)
 
 
+# Safe detector failure codes. Tool stderr and exception text can echo scanned source or
+# secrets, so a report only ever carries one of these.
+DETECTOR_ERROR_CODES = frozenset(
+    {
+        "timeout",
+        "io_error",
+        "tool_unavailable",
+        "tool_failed",
+        "malformed_output",
+        "missing_report",
+        "unmapped_rule",
+        "unrecognized_output",
+        "crashed",
+    }
+)
+
+
 @dataclass(frozen=True, slots=True)
 class DetectorResult:
     detector: str
     findings: tuple[Finding, ...]
-    error: str | None = None
+    error: str | None = None  # One of DETECTOR_ERROR_CODES.
 
 
 @dataclass(frozen=True, slots=True)

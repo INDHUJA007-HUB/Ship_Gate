@@ -90,7 +90,7 @@ def test_semgrep_finding_ids_do_not_depend_on_install_path() -> None:
 
 def test_unknown_semgrep_rule_is_partial_not_mislabelled() -> None:
     result, _ = semgrep_result("first-commit.unsafe-shell", "first-commit.something-new")
-    assert result.error == "unmapped semgrep rules: first-commit.something-new"
+    assert result.error == "unmapped_rule"
     assert [item.evidence.rule_id for item in result.findings] == ["first-commit.unsafe-shell"]
 
 
@@ -148,7 +148,7 @@ def test_checkov_unrecognized_path_fails_closed() -> None:
     result = checkov(
         ROOT, "hash", Settings(), runner=lambda *_: CommandResult(json.dumps(payload), "", 1)
     )
-    assert result.error and not result.findings
+    assert result.error == "unrecognized_output" and not result.findings
 
 
 def test_checkov_without_templates_starts_no_process(tmp_path) -> None:

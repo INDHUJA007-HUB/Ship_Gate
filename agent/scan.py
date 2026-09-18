@@ -5,10 +5,9 @@ from pathlib import Path
 
 from agent.cache import ScanCache
 from agent.config import Settings
+from agent.detectors import selected
 from agent.models import SCHEMA_VERSION, DetectorResult, ScanReport
 from agent.preflight import PreflightError, inspect_tree
-from agent.tools.external import checkov, gitleaks, semgrep
-from agent.tools.patterns import missing_environment, route_safety
 
 
 class ScanService:
@@ -33,28 +32,17 @@ class ScanService:
             if cached:
                 return cached
         content_hash, files = preflight.content_hash, preflight.files
-        tasks = [
-            lambda: missing_environment(root, content_hash, files),
-            lambda: route_safety(root, content_hash, files),
-        ]
-        if self.external_detectors:
-            tasks.extend(
-                [
-                    lambda: gitleaks(root, content_hash, self.settings),
-                    lambda: semgrep(root, content_hash, self.settings),
-                    lambda: checkov(root, content_hash, self.settings, files=files),
-                ]
-            )
+        detectors = selected(self.external_detectors)
 
-        def execute(task):
+        def execute(detector):
             try:
-                return task()
+                return detector.run(root, content_hash, files, self.settings)
             except Exception:
                 # Tool exceptions can contain source or secrets; retain only a safe status.
-                return DetectorResult("detector", (), "detector_crashed")
+                return DetectorResult(detector.name, (), "crashed")
 
-        with ThreadPoolExecutor(max_workers=len(tasks)) as pool:
-            results = list(pool.map(execute, tasks))
+        with ThreadPoolExecutor(max_workers=len(detectors)) as pool:
+            results = list(pool.map(execute, detectors))
         findings = tuple(
             sorted(
                 (finding for result in results for finding in result.findings),
