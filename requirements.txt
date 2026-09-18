@@ -1,0 +1,4 @@
+# AWS Lambda runtime dependencies. Keep this aligned with pyproject.toml's runtime/provider pins.
+PyYAML>=6.0.2
+cedarpy==4.8.7
+anthropic[bedrock]>=1.5,<2

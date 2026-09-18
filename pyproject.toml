@@ -10,11 +10,16 @@ readme = "README.md"
 requires-python = ">=3.12"
 license = { text = "MIT" }
 authors = [{ name = "First Commit contributors" }]
-dependencies = ["PyYAML>=6.0.2", "cedarpy==4.8.7"]
+dependencies = [
+    "PyYAML>=6.0.2",
+    "cedarpy==4.8.7",
+    "strands-agents>=1.55,<2",
+]
 
 [project.optional-dependencies]
 dev = ["pytest>=8.3", "ruff>=0.9"]
 aws = ["boto3>=1.43,<2"]
+ai = ["anthropic[bedrock]>=1.5,<2"]
 
 [project.scripts]
 first-commit = "agent.cli:main"

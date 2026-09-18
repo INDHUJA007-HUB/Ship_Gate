@@ -1,8 +1,8 @@
 # Architecture
 
-The built system is a local, deterministic core. The AWS layers in the master
-reference (API Gateway, Step Functions, DynamoDB, S3, Cognito, Bedrock) are not
-provisioned yet; `infra/template.yaml` only declares the findings table.
+The built system has a local deterministic core plus an AWS SAM control-plane
+template. The template is not evidence that resources have been deployed; see
+the verification reports for the boundary between mocked, local and live tests.
 
 Phase numbers below follow the master reference. The earlier "Phase 2
 governance / Phase 3 remediation" labels map to master Phases 4, 7 and 8.
@@ -30,6 +30,39 @@ report + trusted context -> hard cap -> canonical facts -> tenant-scoped cache
   -> embedded Cedar (11 policy files) -> permit | needs_human_approval | deny
 ```
 
+## AI reasoning (master Phase 5)
+
+```text
+scan report + policy result -> evidence packet (grouped, sanitized, redacted, injection-flagged)
+  -> route each group and the synthesis: template | small model | large model
+  -> tenant content-hash cache + all-or-none leases -> budget reservation
+  -> one evidence-first prompt -> forced tool or Ollama JSON schema -> schema + grounding validation
+  -> accept | escalate | one corrective retry | human review with vetted template
+questions -> sanitize, redact, resolve, score -> blocked | clarify | deterministic | knowledge
+  | reuse explanations | synthesis | model answer (validated the same way)
+```
+
+Details: [Phase 5 guide](phase-5-reasoning.md),
+[ADR 0009](ADRs/0009-tiered-validated-model-explanations.md) and
+[ADR 0010](ADRs/0010-local-open-models-through-ollama.md).
+
+## Resilient orchestration (master Phase 6)
+
+```text
+tenant-bound Strands agent | CLI | authenticated HTTP API
+  -> deterministic run ID / named execution
+  -> Prepare -> independent detector Map -> Merge + Cedar -> Explain -> Finalize
+                 | defect / exhausted retry                |
+                 +-> review item + labeled partial result  +-> vetted template fallback
+  -> resume generation reuses successful content checkpoints
+```
+
+AWS uses Step Functions Standard with dedicated least-privilege Lambda roles, DynamoDB run/review
+records, S3 snapshots/checkpoints, and a FIFO SQS review queue. EventBridge reconciles an execution
+that fails outside the normal finalizer. Local mode interprets the exact same ASL definition and
+uses SQLite/files. Details: [Phase 6 guide](phase-6-orchestration.md) and
+[ADR 0011](ADRs/0011-durable-standard-workflow-and-resume.md).
+
 ## Remediation and local validation (master Phases 7-8)
 
 ```text
@@ -50,5 +83,8 @@ reviewed operations -> IAM proposal (JSON or SAM/CloudFormation YAML, never writ
 | Candidate code | Untrusted | Executed only in the ADR 0007 container sandbox |
 | Operations, manifest, approval | Trusted operator input | Must live outside the source tree |
 | Packaged rules and Cedar policies | Trusted | Hashed into decisions and approvals |
+| Packaged prompts, playbooks and glossary | Trusted | Versioned into every explanation cache key |
+| User questions | Untrusted | Sanitized, redacted, screened for overrides; rewritten before any model sees them |
+| Model output | Untrusted | Validated against schema and evidence; never alters a decision |
 
 Decisions are recorded in [the ADRs](ADRs/).

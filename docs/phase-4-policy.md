@@ -80,16 +80,17 @@ and DeploymentAttempt records; the API/control-plane can use it when
 `FIRST_COMMIT_MODE=aws`. The CLI retains `--cache-db` for an explicit local,
 portable policy-audit file.
 
-## Phase 5 handoff, not implemented in this phase
+## Phase 5 handoff
 
-A future model may write explanations and escalate to review, but must never
-lower Cedar's decision or supply a permission probability. The
-model interface must accept bounded structured facts only, group by category,
-enforce a fixed total-attempt/model-call budget, deduplicate concurrent requests,
-cache on stable policy/evidence/model/prompt versions, and separately report
-throttling versus an intentional quota break. Classification and synthesis
-tiers need separate routing and measured usage; token budgets require explicit
-truncation flags. These are Phase 5 requirements, not working features today.
+The handoff requirements are implemented in the [Phase 5 guide](phase-5-reasoning.md):
+- Models explain and may escalate, but never lower a decision or supply a
+  probability.
+- Facts are bounded and grouped; model attempts are budgeted; concurrent
+  requests are deduplicated.
+- The cache is keyed on policy, evidence, model and prompt versions.
+- Throttling and budget stops are reported separately, with per-tier routing
+  and usage.
+- Truncated evidence is flagged.
 
-No Bedrock/local-model inference is invoked by this phase; reports expose
-`model_calls: 0` and actual Cedar request/cache-hit counters.
+The policy engine itself still makes no model calls; its reports keep
+`model_calls: 0`.
