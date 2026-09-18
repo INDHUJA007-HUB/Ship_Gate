@@ -282,4 +282,61 @@ def explain_worker_handler(event, context):
 
 
 def deploy_worker_handler(event, context):
-    return {"status": "not_implemented", "execution_id": event.get("execution_id")}
+    from agent.deployment import DeployService, DeploymentError
+    from agent.telemetry import TelemetryService, TelemetryError
+    from agent.orchestration.v1_contracts import DeploymentRequestV1
+
+    action = event.get("action")
+    if not action:
+        return {"status": "not_implemented"}
+        
+    try:
+        if action == "collect_evidence":
+            telemetry = TelemetryService()
+            result = telemetry.collect_evidence(
+                tenant_id=event.get("tenant_id"),
+                trace_id=event.get("trace_id"),
+                start_time=event.get("start_time"),
+                end_time=event.get("end_time"),
+                log_group=event.get("log_group")
+            )
+            return result.to_dict()
+
+        deploy = DeployService(store=load_adapters().pipeline)
+        req_data = event.get("request", {})
+        request = DeploymentRequestV1(**req_data) if req_data else None
+
+        if action == "validate":
+            deploy.validate_request(request)
+            return {"status": "validated"}
+        elif action == "create_change_set":
+            template_body = event.get("template_body", "{}")
+            arn = deploy.create_change_set(request, template_body)
+            return {"change_set_arn": arn}
+        elif action == "describe_change_set":
+            arn = event.get("change_set_arn")
+            res = deploy.describe_change_set(arn)
+            return {"Status": res.get("Status"), "StatusReason": res.get("StatusReason")}
+        elif action == "execute_change_set":
+            arn = event.get("change_set_arn")
+            deploy.execute_change_set(request, arn)
+            return {"status": "executing"}
+        elif action == "poll_execution":
+            stack_name = event.get("stack_name")
+            status = deploy.poll_execution(stack_name)
+            return {"status": status}
+        elif action == "smoke_test":
+            endpoint = event.get("endpoint")
+            deploy.run_smoke_test(endpoint)
+            return {"status": "smoke_test_passed"}
+        elif action == "request_approval":
+            return {"status": "waiting_for_approval", "task_token": event.get("task_token")}
+        else:
+            return {"status": "unknown_action"}
+            
+    except DeploymentError as e:
+        err_class = type(e.code, (Exception,), {})
+        raise err_class(str(e))
+    except TelemetryError as e:
+        err_class = type(e.code, (Exception,), {})
+        raise err_class(str(e))
