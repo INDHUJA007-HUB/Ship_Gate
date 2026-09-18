@@ -1,18 +1,39 @@
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
-Description: First Commit foundation; Phase 1 does not provision it.
+Description: First Commit serverless control plane. Mode selects adapters, never a second template.
 
 Parameters:
   Mode:
     Type: String
     Default: aws
     AllowedValues: [aws, local]
+  ArchiveRetentionDays:
+    Type: Number
+    Default: 7
+    MinValue: 1
+    MaxValue: 30
+
+Globals:
+  Function:
+    Runtime: python3.12
+    Architectures: [x86_64]
+    Timeout: 30
+    MemorySize: 512
+    Tracing: Active
+    Environment:
+      Variables:
+        FIRST_COMMIT_MODE: !Ref Mode
+        FIRST_COMMIT_TABLE_NAME: !Ref ControlPlaneTable
+        FIRST_COMMIT_ARCHIVE_BUCKET: !Ref RepoArchiveBucket
+        LOG_LEVEL: INFO
 
 Resources:
-  FindingsTable:
+  ControlPlaneTable:
     Type: AWS::DynamoDB::Table
     Properties:
       BillingMode: PAY_PER_REQUEST
+      PointInTimeRecoverySpecification: {PointInTimeRecoveryEnabled: true}
+      SSESpecification: {SSEEnabled: true}
       AttributeDefinitions:
         - AttributeName: PK
           AttributeType: S
@@ -24,3 +45,206 @@ Resources:
         - AttributeName: SK
           KeyType: RANGE
 
+  RepoArchiveBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Retain
+    UpdateReplacePolicy: Retain
+    Properties:
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - ServerSideEncryptionByDefault: {SSEAlgorithm: AES256}
+      PublicAccessBlockConfiguration:
+        BlockPublicAcls: true
+        BlockPublicPolicy: true
+        IgnorePublicAcls: true
+        RestrictPublicBuckets: true
+      LifecycleConfiguration:
+        Rules:
+          - Id: expire-repository-archives
+            Status: Enabled
+            ExpirationInDays: !Ref ArchiveRetentionDays
+      OwnershipControls:
+        Rules: [{ObjectOwnership: BucketOwnerEnforced}]
+
+  UserPool:
+    Type: AWS::Cognito::UserPool
+    Properties:
+      UserPoolName: !Sub '${AWS::StackName}-users'
+      UsernameAttributes: [email]
+      AutoVerifiedAttributes: [email]
+      Policies:
+        PasswordPolicy: {MinimumLength: 12, RequireLowercase: true, RequireUppercase: true, RequireNumbers: true, RequireSymbols: true}
+
+  UserPoolClient:
+    Type: AWS::Cognito::UserPoolClient
+    Properties:
+      UserPoolId: !Ref UserPool
+      GenerateSecret: false
+      ExplicitAuthFlows: [ALLOW_USER_SRP_AUTH, ALLOW_REFRESH_TOKEN_AUTH]
+      PreventUserExistenceErrors: ENABLED
+
+  HttpApi:
+    Type: AWS::Serverless::HttpApi
+    Properties:
+      CorsConfiguration:
+        AllowOrigins: ['http://localhost:5173']
+        AllowHeaders: [authorization, content-type, x-first-commit-tenant]
+        AllowMethods: [POST, GET]
+      Auth:
+        Authorizers:
+          CognitoJwt:
+            JwtConfiguration:
+              issuer: !Sub 'https://cognito-idp.${AWS::Region}.amazonaws.com/${UserPool}'
+              audience: [!Ref UserPoolClient]
+            IdentitySource: '$request.header.Authorization'
+        DefaultAuthorizer: CognitoJwt
+
+  ApiHandlerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: api-control-plane-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: states:StartExecution
+                Resource: !Ref ScanWorkflow
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+
+  ScanWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: scan-worker-archive-and-findings
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [s3:GetObject, s3:DeleteObject]
+                Resource: !Sub '${RepoArchiveBucket.Arn}/tenant/*'
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem, dynamodb:Query]
+                Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+
+  ExplainWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: explain-worker-findings-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:Query]
+                Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+
+  DeployWorkerRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: lambda.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: deploy-worker-records-only
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [dynamodb:GetItem, dynamodb:PutItem, dynamodb:UpdateItem]
+                Resource: !GetAtt ControlPlaneTable.Arn
+              - Effect: Allow
+                Action: [logs:CreateLogGroup, logs:CreateLogStream, logs:PutLogEvents, xray:PutTraceSegments, xray:PutTelemetryRecords]
+                Resource: '*'
+
+  ApiHandler:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ../
+      Handler: api.handlers.router_handler
+      Role: !GetAtt ApiHandlerRole.Arn
+      Environment:
+        Variables:
+          FIRST_COMMIT_WORKFLOW_ARN: !Ref ScanWorkflow
+      Events:
+        StartScan:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: /scans
+            Method: POST
+        GetScan:
+          Type: HttpApi
+          Properties:
+            ApiId: !Ref HttpApi
+            Path: '/scans/{scan_id}'
+            Method: GET
+
+  ScanWorker:
+    Type: AWS::Serverless::Function
+    Properties: {CodeUri: ../, Handler: api.handlers.scan_worker_handler, Role: !GetAtt ScanWorkerRole.Arn, Timeout: 300, MemorySize: 1024}
+  ExplainWorker:
+    Type: AWS::Serverless::Function
+    Properties: {CodeUri: ../, Handler: api.handlers.explain_worker_handler, Role: !GetAtt ExplainWorkerRole.Arn}
+  DeployWorker:
+    Type: AWS::Serverless::Function
+    Properties: {CodeUri: ../, Handler: api.handlers.deploy_worker_handler, Role: !GetAtt DeployWorkerRole.Arn}
+
+  StepFunctionsRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement: [{Effect: Allow, Principal: {Service: states.amazonaws.com}, Action: 'sts:AssumeRole'}]
+      Policies:
+        - PolicyName: workflow-invoke-workers
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: lambda:InvokeFunction
+                Resource: [!GetAtt ScanWorker.Arn, !GetAtt ExplainWorker.Arn]
+
+  ScanWorkflow:
+    Type: AWS::Serverless::StateMachine
+    Properties:
+      Type: EXPRESS
+      Role: !GetAtt StepFunctionsRole.Arn
+      Definition:
+        StartAt: Scan
+        States:
+          Scan:
+            Type: Task
+            Resource: !GetAtt ScanWorker.Arn
+            Retry: [{ErrorEquals: [Lambda.ServiceException, Lambda.TooManyRequestsException], IntervalSeconds: 2, MaxAttempts: 2, BackoffRate: 2}]
+            Next: Explain
+          Explain:
+            Type: Task
+            Resource: !GetAtt ExplainWorker.Arn
+            End: true
+
+Outputs:
+  ApiUrl: {Value: !Sub 'https://${HttpApi}.execute-api.${AWS::Region}.amazonaws.com'}
+  TableName: {Value: !Ref ControlPlaneTable}
+  ArchiveBucket: {Value: !Ref RepoArchiveBucket}
+  UserPoolId: {Value: !Ref UserPool}
